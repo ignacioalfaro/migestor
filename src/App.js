@@ -75,7 +75,7 @@ const TailwindCard = ({ children, className = '' }) => {
 };
 
 // TailwindInput
-const TailwindInput = ({ label, type = 'text', value, onChange, placeholder, required = false, className = '', min = null, max = null, step = null, list = null }) => {
+const TailwindInput = ({ label, type = 'text', value, onChange, placeholder, required = false, className = '', min = null, max = null, step = null, list = null, inputMode = null, pattern = null }) => {
   return (
     <div className="mb-4">
       {label && <label className="block text-gray-700 text-sm font-bold mb-2">{label}</label>}
@@ -89,6 +89,8 @@ const TailwindInput = ({ label, type = 'text', value, onChange, placeholder, req
         max={max}
         step={step}
         list={list}
+        inputMode={inputMode} // Añadido para teclado numérico
+        pattern={pattern}     // Añadido para teclado numérico
         className={`shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 ${className}`}
       />
     </div>
@@ -203,14 +205,15 @@ function App() {
     try {
       // Configuración de Firebase para tu proyecto
       // Esta configuración es la que obtuviste de la Consola de Firebase
+      // ¡REEMPLAZA ESTOS VALORES CON LOS QUE OBTUVISTE DE LA CONSOLA DE FIREBASE!
       const hardcodedFirebaseConfig = {
-        apiKey: "AIzaSyCbbYSf8njsowgDWfHfzJMb2BVjr1QCdT0",
-        authDomain: "migestordegastos-e7e7c.firebaseapp.com",
-        projectId: "migestordegastos-e7e7c",
-        storageBucket: "migestordegastos-e7e7c.firebasestorage.app",
-        messagingSenderId: "367300940808",
-        appId: "1:367300940808:web:1ffaf415ad6221df512dbd",
-        measurementId: "G-GWGHNBBC38"
+        apiKey: "AIzaSyCbbYSf8njsowgDWfHfzJMb2BVjr1QCdT0", // Reemplaza con tu API Key
+        authDomain: "migestordegastos-e7e7c.firebaseapp.com", // Reemplaza con tu Auth Domain
+        projectId: "migestordegastos-e7e7c", // Reemplaza con tu Project ID
+        storageBucket: "migestordegastos-e7e7c.firebasestorage.app", // Reemplaza con tu Storage Bucket
+        messagingSenderId: "367300940808", // Reemplaza con tu Messaging Sender ID
+        appId: "1:367300940808:web:1ffaf415ad6221df512dbd", // Reemplaza con tu App ID
+        measurementId: "G-GWGHNBBC38" // Reemplaza con tu Measurement ID (opcional)
       };
 
       // Usa la configuración inyectada por Canvas si está disponible, de lo contrario usa la hardcodeada
@@ -235,6 +238,10 @@ function App() {
 
       setDb(firestore);
       setAuth(firebaseAuth);
+
+      // Log para ver la configuración que está usando la instancia de auth
+      console.log("App: Configuración de Auth (firebaseAuth.app.options):", firebaseAuth.app.options);
+
 
       // Autenticación de Firebase
       const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
@@ -473,6 +480,7 @@ function CommunityWalletsList({ onSelectWallet }) {
     if (!db || !userId) return;
 
     // Consulta para billeteras donde el usuario actual es miembro
+    // Se asegura de que la estructura del miembro en la consulta coincida con cómo se guarda
     const q = query(collection(db, `artifacts/${appId}/public/data/communityWallets`), where('members', 'array-contains', { id: userId, name: userName || 'Tú' }));
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const walletsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
@@ -853,7 +861,7 @@ function CommunityWalletDetail({ wallet, onBack }) {
         ) : (
           <ul className="divide-y divide-gray-200">
             {income.map((item) => (
-              <li key={item.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2">
+              <li key={item.id} className="flex flex-col sm:flex-row justify-content-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2">
                 <div>
                   <span className="font-medium text-gray-800">{item.description}</span>
                   <p className="text-gray-500 text-xs mt-1">
@@ -898,7 +906,7 @@ function CommunityWalletDetail({ wallet, onBack }) {
                     <ul className="list-disc list-inside ml-2">
                       {Object.entries(expense.splitDetails).map(([memberId, value]) => (
                         <li key={memberId}>
-                          {members.find(m => m.id === memberId)?.name || memberId}: {exp.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
+                          {members.find(m => m.id === memberId)?.name || memberId}: {expense.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
                         </li>
                       ))}
                     </ul>
@@ -1007,6 +1015,8 @@ function AddIncomeModal({ walletId, onClose, show }) {
           onChange={(e) => setAmount(e.target.value)}
           step="0.01"
           required
+          inputMode="numeric" // Teclado numérico
+          pattern="[0-9]*"   // Patrón para números
         />
         <div className="flex justify-end gap-2 mt-6">
           <TailwindButton variant="secondary" onClick={onClose}>
@@ -1135,7 +1145,7 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
       });
     }
 
-    let installmentAmount = 0;
+    let installmentAmount = null;
     let installmentEndDate = null;
 
     if (isInstallment) {
@@ -1143,27 +1153,32 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
       installmentAmount = totalAmount / numInstallments;
 
       const today = new Date();
+      // Calculate end date for installments
       const endDate = new Date(today.getFullYear(), today.getMonth() + numInstallments, today.getDate());
       installmentEndDate = endDate;
     }
 
+    const expenseDataToSave = {
+      description: description.trim(),
+      amount: totalAmount,
+      payerId: payerId,
+      type: expenseType,
+      bank: expenseType === 'credit_card' ? bank.trim() : null,
+      cardType: expenseType === 'credit_card' ? cardType.trim() : null,
+      date: serverTimestamp(),
+      splitType: splitType,
+      splitDetails: finalSplitDetails,
+      isSettled: false,
+      isInstallment: isInstallment,
+      totalInstallments: isInstallment ? parseInt(totalInstallments) : null, // Ensure integer
+      installmentAmount: isInstallment ? installmentAmount : null,
+      installmentEndDate: isInstallment ? installmentEndDate : null, // This will be a Date object, Firestore will convert it to Timestamp
+    };
+
+    console.log("AddCommunityExpenseModal: Datos del gasto a guardar:", expenseDataToSave);
+
     try {
-      await addDoc(collection(db, `artifacts/${appId}/public/data/communityWallets/${walletId}/expenses`), {
-        description: description.trim(),
-        amount: totalAmount,
-        payerId: payerId,
-        type: expenseType,
-        bank: expenseType === 'credit_card' ? bank.trim() : null,
-        cardType: expenseType === 'credit_card' ? cardType.trim() : null,
-        date: serverTimestamp(),
-        splitType: splitType,
-        splitDetails: finalSplitDetails,
-        isSettled: false,
-        isInstallment: isInstallment,
-        totalInstallments: isInstallment ? parseInt(totalInstallments) : null,
-        installmentAmount: isInstallment ? installmentAmount : null,
-        installmentEndDate: isInstallment ? installmentEndDate : null,
-      });
+      await addDoc(collection(db, `artifacts/${appId}/public/data/communityWallets/${walletId}/expenses`), expenseDataToSave);
       showMessage("Gasto añadido exitosamente!", "success");
       onClose();
     } catch (error) {
@@ -1189,6 +1204,8 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
           onChange={(e) => setAmount(e.target.value)}
           step="0.01"
           required
+          inputMode="numeric" // Teclado numérico
+          pattern="[0-9]*"   // Patrón para números
         />
         <TailwindSelect label="Pagado por:" value={payerId} onChange={(e) => setPayerId(e.target.value)}>
           {members.map(m => (
@@ -1245,6 +1262,8 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
                     step="0.01"
                     placeholder={splitType === 'percentage' ? '%' : '$'}
                     className="flex-grow mr-2"
+                    inputMode="numeric" // Teclado numérico
+                    pattern="[0-9]*"   // Patrón para números
                   />
                   {splitType === 'percentage' && <span className="text-gray-600">%</span>}
                 </div>
@@ -1268,6 +1287,8 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
             onChange={(e) => setTotalInstallments(e.target.value)}
             min="1"
             required={isInstallment}
+            inputMode="numeric" // Teclado numérico
+            pattern="[0-9]*"   // Patrón para números
           />
         )}
 
@@ -1500,11 +1521,11 @@ function PersonalWallet() {
 
       while (i < j) {
         const [debtorId, debtorBalance] = sortedBalances[i];
-        const [creditorId, creditorIdBalance] = sortedBalances[j];
+        const [creditorId, creditorBalance] = sortedBalances[j];
 
-        if (debtorBalance >= -0.01 || creditorIdBalance <= 0.01) break;
+        if (debtorBalance >= -0.01 || creditorBalance <= 0.01) break;
 
-        const amountToSettle = Math.min(Math.abs(debtorBalance), creditorIdBalance);
+        const amountToSettle = Math.min(Math.abs(debtorBalance), creditorBalance);
 
         // Solo añadir reembolsos relevantes para el usuario actual
         if (debtorId === userId || creditorId === userId) {
@@ -1585,6 +1606,8 @@ function PersonalWallet() {
             onChange={(e) => setAmount(e.target.value)}
             step="0.01"
             required
+            inputMode="numeric" // Teclado numérico
+            pattern="[0-9]*"   // Patrón para números
           />
           <TailwindSelect label="Tipo:" value={type} onChange={(e) => setType(e.target.value)}>
             <option value="expense">Gasto</option>
@@ -1739,6 +1762,8 @@ function TransferModal({ moneyStorageBanks, onClose, show }) {
           onChange={(e) => setAmount(e.target.value)}
           step="0.01"
           required
+          inputMode="numeric" // Teclado numérico
+          pattern="[0-9]*"   // Patrón para números
         />
         <TailwindInput
           label="Descripción:"
@@ -1843,67 +1868,77 @@ function FutureExpenses() {
           const expenseSnapshot = await getDocs(qExpenses);
           expenseSnapshot.docs.forEach(expenseDoc => {
             const expenseData = expenseDoc.data();
-            if (expenseData.splitDetails && expenseData.splitDetails[userId]) {
-              const userShare = expenseData.splitDetails[userId];
-              const expenseDate = expenseData.date ? new Date(expenseData.date.seconds * 1000) : new Date();
+            console.log("FutureExpenses: Procesando gasto de tarjeta:", expenseData);
 
-              const dueDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth() + 1, 1);
-              const dueMonthYear = `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, '0')}`;
+            // Ensure splitDetails[userId] is a valid number
+            const userShare = parseFloat(expenseData.splitDetails?.[userId]) || 0;
+            if (userShare === 0 && expenseData.payerId !== userId) {
+              console.log("FutureExpenses: Usuario no involucrado en este gasto o su participación es 0. Saltando.");
+              return; // Skip if user is not involved or their share is 0
+            }
 
-              const bankName = expenseData.bank || 'Desconocido';
-              const cardType = expenseData.cardType || 'General';
-              const key = `${bankName} - ${cardType}`;
+            const expenseDate = expenseData.date && expenseData.date.seconds ? new Date(expenseData.date.seconds * 1000) : new Date();
 
-              if (!creditCardDebtsByMonthAndCard[dueMonthYear]) {
-                creditCardDebtsByMonthAndCard[dueMonthYear] = {};
+            const dueDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth() + 1, 1);
+            const dueMonthYear = `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, '0')}`;
+
+            const bankName = expenseData.bank || 'Desconocido';
+            const cardType = expenseData.cardType || 'General';
+            const key = `${bankName} - ${cardType}`;
+
+            if (!creditCardDebtsByMonthAndCard[dueMonthYear]) {
+              creditCardDebtsByMonthAndCard[dueMonthYear] = {};
+            }
+            if (!creditCardDebtsByMonthAndCard[dueMonthYear][key]) {
+              creditCardDebtsByMonthAndCard[dueMonthYear][key] = { amount: 0, reimbursements: [] };
+            }
+
+            creditCardDebtsByMonthAndCard[dueMonthYear][key].amount += userShare;
+
+            const payer = membersInWallet.find(m => m.id === expenseData.payerId);
+            const payerName = payer ? payer.name : 'Desconocido';
+
+            for (const memberId in expenseData.splitDetails) {
+              const memberShare = parseFloat(expenseData.splitDetails[memberId]) || 0;
+
+              if (expenseData.payerId === userId && memberId !== userId && memberShare > 0) {
+                const participant = membersInWallet.find(m => m.id === memberId);
+                const participantName = participant ? participant.name : 'Desconocido';
+                creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements.push({
+                  type: 'owed_to_you',
+                  from: participantName,
+                  fromId: memberId,
+                  toId: userId,
+                  amount: memberShare,
+                  description: expenseData.description,
+                  walletName: wallet.name,
+                });
               }
-              if (!creditCardDebtsByMonthAndCard[dueMonthYear][key]) {
-                creditCardDebtsByMonthAndCard[dueMonthYear][key] = { amount: 0, reimbursements: [] };
-              }
-
-              creditCardDebtsByMonthAndCard[dueMonthYear][key].amount += userShare;
-
-              const payer = membersInWallet.find(m => m.id === expenseData.payerId);
-              const payerName = payer ? payer.name : 'Desconocido';
-
-              for (const memberId in expenseData.splitDetails) {
-                if (expenseData.payerId === userId && memberId !== userId && expenseData.splitDetails[memberId] > 0) {
-                  const participant = membersInWallet.find(m => m.id === memberId);
-                  const participantName = participant ? participant.name : 'Desconocido';
-                  creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements.push({
-                    type: 'owed_to_you',
-                    from: participantName,
-                    fromId: memberId,
-                    toId: userId,
-                    amount: expenseData.splitDetails[memberId],
-                    description: expenseData.description,
-                    walletName: wallet.name,
-                  });
-                }
-                else if (memberId === userId && expenseData.payerId !== userId && expenseData.splitDetails[memberId] > 0) {
-                  creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements.push({
-                    type: 'you_owe',
-                    to: payerName,
-                    fromId: userId,
-                    toId: expenseData.payerId,
-                    amount: expenseData.splitDetails[memberId],
-                    description: expenseData.description,
-                    walletName: wallet.name,
-                  });
-                }
+              else if (memberId === userId && expenseData.payerId !== userId && memberShare > 0) {
+                creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements.push({
+                  type: 'you_owe',
+                  to: payerName,
+                  fromId: userId,
+                  toId: expenseData.payerId,
+                  amount: memberShare,
+                  description: expenseData.description,
+                  walletName: wallet.name,
+                });
               }
             }
           });
         }
       }
+      console.log("FutureExpenses: creditCardDebtsByMonthAndCard final:", creditCardDebtsByMonthAndCard);
 
       const batch = writeBatch(db);
       const futureExpensesCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`);
 
       const existingCommunityCreditCardDebts = futureItems.filter(item => item.type === 'community_credit_card_debt');
+      console.log("FutureExpenses: Deudas de tarjeta existentes:", existingCommunityCreditCardDebts);
 
       existingCommunityCreditCardDebts.forEach(existingItem => {
-        const itemStartDate = existingItem.startDate ? existingItem.startDate.toDate() : new Date();
+        const itemStartDate = existingItem.startDate && existingItem.startDate.toDate ? existingItem.startDate.toDate() : new Date();
         const itemMonthYear = `${itemStartDate.getFullYear()}-${String(itemStartDate.getMonth() + 1).padStart(2, '0')}`;
         const itemKey = existingItem.description.replace('Deuda Tarjeta Crédito (Comunitaria) - ', '');
 
@@ -1912,6 +1947,7 @@ function FutureExpenses() {
                                 creditCardDebtsByMonthAndCard[itemMonthYear][itemKey].reimbursements.length > 0;
 
         if (!hasRelevantDebt) {
+          console.log("FutureExpenses: Eliminando deuda de tarjeta existente (no relevante):", existingItem.id);
           batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, existingItem.id));
         }
       });
@@ -1926,6 +1962,7 @@ function FutureExpenses() {
           if (reimbursements.length > 0) {
             const existingItem = existingCommunityCreditCardDebts.find(item =>
               item.description === description &&
+              item.startDate && item.startDate.toDate &&
               item.startDate.toDate().getFullYear() === startDate.getFullYear() &&
               item.startDate.toDate().getMonth() === startDate.getMonth()
             );
@@ -1935,15 +1972,17 @@ function FutureExpenses() {
               amount: amount,
               type: 'community_credit_card_debt',
               recurrence: 'one_time',
-              startDate: startDate,
+              startDate: startDate, // This will be a Date object, Firestore will convert it to Timestamp
               sourceWalletId: 'all_community_wallets',
               reimbursements: reimbursements,
               createdAt: serverTimestamp(),
             };
 
             if (existingItem) {
+              console.log("FutureExpenses: Actualizando deuda de tarjeta existente:", existingItem.id, debtItemData);
               batch.update(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, existingItem.id), debtItemData);
             } else {
+              console.log("FutureExpenses: Añadiendo nueva deuda de tarjeta:", debtItemData);
               batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`)), debtItemData);
             }
           }
@@ -1951,10 +1990,11 @@ function FutureExpenses() {
       }
 
       await batch.commit();
+      console.log("FutureExpenses: Operaciones de batch completadas.");
     };
 
     aggregateCreditCardDebts();
-  }, [db, userId, appId, allCommunityWallets, futureItems]);
+  }, [db, userId, appId, allCommunityWallets, futureItems]); // Dependencias actualizadas
 
   const handleAddFutureItem = async (e) => {
     e.preventDefault();
@@ -2017,10 +2057,11 @@ function FutureExpenses() {
     let totalExpense = 0;
 
     futureItems.forEach(item => {
-      const itemStartDate = item.startDate ? new Date(item.startDate.seconds * 1000) : new Date();
+      const itemStartDate = item.startDate && item.startDate.seconds ? new Date(item.startDate.seconds * 1000) : new Date();
       const itemStartMonth = itemStartDate.getMonth() + 1;
       const itemStartYear = itemStartDate.getFullYear();
 
+      // Consider items that started before or in the selected month/year
       if (itemStartYear < year || (itemStartYear === year && itemStartMonth <= month)) {
         if (item.type === 'income') {
           totalIncome += item.amount;
@@ -2076,6 +2117,8 @@ function FutureExpenses() {
             onChange={(e) => setAmount(e.target.value)}
             step="0.01"
             required
+            inputMode="numeric" // Teclado numérico
+            pattern="[0-9]*"   // Patrón para números
           />
           <TailwindSelect label="Tipo:" value={type} onChange={(e) => setType(e.target.value)}>
             <option value="expense">Gasto</option>
@@ -2130,7 +2173,7 @@ function FutureExpenses() {
         ) : (
           <ul className="divide-y divide-gray-200">
             {futureItems.map((item) => (
-              <li key={item.id} className="bg-white shadow-sm rounded-lg mb-2 p-4">
+              <li key={item.id} className="bg-white shadow-sm rounded-lg mb-2 p-4"> {/* This is line 2209 */}
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
                   <span className="font-medium text-gray-800">{item.description}</span>
                   <span className={`font-bold text-xl mt-2 sm:mt-0 ${item.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
@@ -2276,7 +2319,7 @@ function BankManagement() {
             required
           />
           <TailwindSelect label="Tipo de Banco:" value={newBankType} onChange={(e) => setNewBankType(e.target.value)}>
-            <option value="money_storage">Banco para Almacenar Dinero</option>
+            <option value="money_storage">Banco para Almacenamiento de Dinero</option>
             <option value="credit_card">Tarjeta de Crédito</option>
           </TailwindSelect>
           <TailwindSelect label="Propietario del Banco:" value={newBankOwner} onChange={(e) => setNewBankOwner(e.target.value)}>
@@ -2330,8 +2373,20 @@ function InviteMemberModal({ walletId, walletName, onClose, show }) {
   const inviteLink = `${window.location.origin}?joinWalletId=${walletId}`;
 
   const handleCopyLink = () => {
-    document.execCommand('copy', false, inviteLink); // Usar document.execCommand para compatibilidad en iframes
-    showMessage("Enlace copiado al portapapeles.", "success");
+    // Usar document.execCommand para compatibilidad en iframes
+    const tempInput = document.createElement('textarea');
+    tempInput.value = inviteLink;
+    document.body.appendChild(tempInput);
+    tempInput.select();
+    try {
+      document.execCommand('copy');
+      showMessage("Enlace copiado al portapapeles.", "success");
+    } catch (err) {
+      console.error('Error al copiar el enlace (execCommand):', err);
+      showMessage("Error al copiar el enlace.", "danger");
+    } finally {
+      document.body.removeChild(tempInput);
+    }
   };
 
   const handleShareWhatsApp = () => {
@@ -2369,35 +2424,54 @@ function JoinWalletModal({ walletId, onClose, onJoinSuccess, show }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!db || !walletId || !userId) return;
+    if (!db || !walletId || !userId) {
+      console.log("JoinWalletModal: db, walletId o userId no disponibles. Saliendo de useEffect.");
+      return;
+    }
+    console.log("JoinWalletModal: Iniciando useEffect. walletId:", walletId, "userId:", userId);
 
     const walletRef = doc(db, `artifacts/${appId}/public/data/communityWallets/${walletId}`);
     const unsubscribe = onSnapshot(walletRef, (docSnap) => {
+      console.log("JoinWalletModal: onSnapshot recibido. docSnap.exists():", docSnap.exists());
       if (docSnap.exists()) {
         const walletData = docSnap.data();
         setWalletName(walletData.name);
+        console.log("JoinWalletModal: Datos de billetera:", walletData);
         if (walletData.members && walletData.members.some(m => m.id === userId)) {
+          console.log("JoinWalletModal: Usuario ya es miembro.");
           setIsMember(true);
           showMessage("Ya eres miembro de esta billetera.", "success");
         } else {
+          console.log("JoinWalletModal: Usuario NO es miembro.");
           setIsMember(false);
         }
       } else {
+        console.log("JoinWalletModal: Billetera no encontrada.");
         setWalletName('Billetera no encontrada');
         showMessage("La billetera a la que intentas unirte no existe.", "danger");
       }
       setLoading(false);
+      console.log("JoinWalletModal: Loading establecido a false.");
     }, (error) => {
-      console.error("Error al obtener billetera para unirse:", error);
+      console.error("JoinWalletModal: Error al obtener billetera para unirse:", error);
       showMessage("Error al cargar la información de la billetera.", "danger");
       setLoading(false);
     });
 
-    return () => unsubscribe();
-  }, [db, walletId, userId, appId, showMessage]);
+    return () => {
+      console.log("JoinWalletModal: Limpiando onSnapshot.");
+      unsubscribe();
+    };
+  }, [db, walletId, userId, userName, appId, showMessage]); // Añadido userName a las dependencias
 
   const handleJoinWallet = async () => {
-    if (!db || !walletId || !userId) return;
+    if (!db || !walletId || !userId) {
+      console.error("handleJoinWallet: db, walletId o userId no disponibles.");
+      showMessage("Error: Datos de usuario no disponibles para unirse a la billetera.", "danger");
+      return;
+    }
+    console.log("handleJoinWallet: Intentando unirse a la billetera. userId:", userId, "userName:", userName);
+
     try {
       const walletRef = doc(db, `artifacts/${appId}/public/data/communityWallets/${walletId}`);
       const walletSnap = await getDoc(walletRef);
@@ -2405,19 +2479,25 @@ function JoinWalletModal({ walletId, onClose, onJoinSuccess, show }) {
       if (walletSnap.exists()) {
         const walletData = walletSnap.data();
         const currentMembers = walletData.members || [];
+        
         if (!currentMembers.some(m => m.id === userId)) {
           const updatedMembers = [...currentMembers, { id: userId, name: userName || 'Tú' }];
+          console.log("handleJoinWallet: Añadiendo nuevo miembro:", { id: userId, name: userName || 'Tú' });
           await updateDoc(walletRef, { members: updatedMembers });
           showMessage(`Te has unido a la billetera "${walletData.name}" exitosamente!`, "success");
-          onJoinSuccess();
+          console.log("handleJoinWallet: updateDoc exitoso.");
+          onJoinSuccess(); // Llama a la función de éxito para cerrar el modal y cambiar la vista
         } else {
+          console.log("handleJoinWallet: Usuario ya era miembro.");
           showMessage("Ya eres miembro de esta billetera.", "info");
+          onJoinSuccess(); // Si ya es miembro, también considera que fue un "éxito" y cierra el modal.
         }
       } else {
+        console.error("handleJoinWallet: La billetera no existe.");
         showMessage("La billetera no existe.", "danger");
       }
     } catch (error) {
-      console.error("Error al unirse a la billetera:", error);
+      console.error("handleJoinWallet: Error al unirse a la billetera:", error);
       showMessage("Error al unirse a la billetera.", "danger");
     }
   };
