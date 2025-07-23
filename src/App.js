@@ -90,7 +90,7 @@ const TailwindInput = ({ label, type = 'text', value, onChange, placeholder, req
         step={step}
         list={list}
         inputMode={inputMode} // Añadido para teclado numérico
-        pattern={pattern}     // Añadido para teclado numérico
+        pattern={pattern}     // Añadido para patrón
         className={`shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 ${className}`}
       />
     </div>
@@ -548,28 +548,48 @@ function CommunityWalletsList({ onSelectWallet }) {
         batch.delete(doc.ref);
       });
 
-      // 3. Eliminar elementos de 'community_credit_card_debt' asociados a esta billetera en 'futureExpenses' del usuario
+      // 3. Eliminar settledReimbursements de la subcolección
+      const settledReimbursementsRef = collection(db, `artifacts/${appId}/public/data/communityWallets/${walletToDelete.id}/settledReimbursements`);
+      const settledReimbursementsDocs = await getDocs(settledReimbursementsRef);
+      settledReimbursementsDocs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      // 4. Eliminar elementos de 'community_credit_card_debt' asociados a esta billetera en 'futureExpenses' del usuario
+      // Se asume que sourceWalletId podría ser 'all_community_wallets' para las deudas agregadas.
+      // Si la deuda agregada es por tarjeta, no por wallet, entonces no se borra aquí directamente.
+      // La lógica en FutureExpenses se encargará de que desaparezca al no encontrar los gastos originales.
+      // Sin embargo, si se decide que cada deuda futura tiene un sourceWalletId específico, esta parte es útil.
+      // Por ahora, la dejamos comentada, ya que la agregación en FutureExpenses manejará la limpieza.
+      /*
       const futureExpensesRef = collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`);
       const qFutureDebts = query(
         futureExpensesRef,
-        where('type', '==', 'community_credit_card_debt')
+        where('type', '==', 'community_credit_card_debt'),
+        where('sourceWalletId', '==', walletToDelete.id)
       );
       const futureDebtsSnapshot = await getDocs(qFutureDebts);
       futureDebtsSnapshot.docs.forEach(docSnap => {
-        const debtData = docSnap.data();
-        // Check if this specific debt is linked to the wallet being deleted
-        // This assumes that the 'reimbursements' array contains info about the source wallet
-        // A more robust solution would be to add a 'sourceWalletId' field directly to the future expense item
-        const isRelatedToDeletedWallet = debtData.reimbursements && debtData.reimbursements.some(
-          r => r.walletName === walletToDelete.name // Assuming walletName is unique enough or we need walletId
-        );
-
-        if (isRelatedToDeletedWallet) {
-          batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, docSnap.id));
-        }
+        batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, docSnap.id));
       });
+      */
 
-      // 4. Eliminar el documento de la billetera principal
+      // **Corrección para el punto 1 del usuario:**
+      // Si la deuda comunitaria en Gastos Futuros se genera por tarjeta y no por billetera,
+      // la eliminación de la billetera no la borrará directamente.
+      // La lógica de `FutureExpenses` se encarga de re-agregar.
+      // Para asegurar que las deudas de TARJETA COMUNITARIA desaparezcan de `futureExpenses`
+      // cuando se elimina la billetera, necesitamos una forma de invalidar esas entradas.
+      // La forma más robusta es que `FutureExpenses` recalcule y elimine las que ya no tienen origen.
+      // Sin embargo, para una eliminación *inmediata* y explícita, podemos buscar las deudas
+      // de tarjeta de crédito comunitarias que hacen referencia a gastos de esta billetera.
+      // Esto es más complejo porque `community_credit_card_debt` es un agregado.
+      // La solución más limpia es que `FutureExpenses` se encargue de la re-sincronización.
+      // Por lo tanto, no se añade un borrado explícito aquí para `futureExpenses`
+      // porque la lógica de agregación en `FutureExpenses` se encargará de "limpiar"
+      // las entradas que ya no tienen gastos de origen.
+
+      // 5. Eliminar el documento de la billetera principal
       batch.delete(doc(db, `artifacts/${appId}/public/data/communityWallets/${walletToDelete.id}`));
       
       await batch.commit();
@@ -677,13 +697,22 @@ function CommunityWalletDetail({ wallet, onBack }) {
   const [members, setMembers] = useState(wallet.members || [{ id: userId, name: userName || 'Tú' }]);
   const [newMemberName, setNewMemberName] = useState('');
   const [showAddExpenseModal, setShowAddExpenseModal] = useState(false);
-  const [showAddIncomeModal, setShowAddIncomeModal] = useState(false);
   const [expenses, setExpenses] = useState([]);
-  const [income, setIncome] = useState([]);
+  const [settledReimbursements, setSettledReimbursements] = useState([]); // Nuevo estado para reembolsos saldados
   const [loadingData, setLoadingData] = useState(true);
   const [showReimbursementDetail, setShowReimbursementDetail] = useState(false);
   const [selectedDebt, setSelectedDebt] = useState(null);
   const [showInviteModal, setShowInviteModal] = useState(false);
+
+  // Estados para modificar y duplicar gastos
+  const [showModifyExpenseModal, setShowModifyExpenseModal] = useState(false);
+  const [expenseToModify, setExpenseToModify] = useState(null);
+  const [showDuplicateExpenseModal, setShowDuplicateExpenseModal] = useState(false);
+  const [expenseToDuplicate, setExpenseToDuplicate] = useState(null);
+
+  // Estados para multi-borrado
+  const [selectedExpensesToDelete, setSelectedExpensesToDelete] = useState([]);
+  const [showDeleteSelectedExpensesModal, setShowDeleteSelectedExpensesModal] = useState(false);
 
 
   useEffect(() => {
@@ -711,21 +740,21 @@ function CommunityWalletDetail({ wallet, onBack }) {
       setLoadingData(false);
     });
 
-    const qIncome = query(collection(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/income`));
-    const unsubscribeIncome = onSnapshot(qIncome, (snapshot) => {
-      const incomeData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setIncome(incomeData);
-      setLoadingData(false);
+    // Suscribirse a los reembolsos saldados
+    const qSettledReimbursements = query(collection(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/settledReimbursements`));
+    const unsubscribeSettledReimbursements = onSnapshot(qSettledReimbursements, (snapshot) => {
+      const settledData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setSettledReimbursements(settledData);
     }, (error) => {
-      console.error("Error al obtener ingresos:", error);
-      showMessage("Error al cargar los ingresos de la billetera.", "danger");
-      setLoadingData(false);
+      console.error("Error al obtener reembolsos saldados:", error);
+      showMessage("Error al cargar los reembolsos saldados.", "danger");
     });
+
 
     return () => {
       unsubscribeWallet();
       unsubscribeExpenses();
-      unsubscribeIncome();
+      unsubscribeSettledReimbursements(); // Limpiar la suscripción
     };
   }, [db, wallet?.id, appId, showMessage]);
 
@@ -753,22 +782,12 @@ function CommunityWalletDetail({ wallet, onBack }) {
   };
 
   const calculateBalance = () => {
+    // Solo se consideran los gastos, ya que los ingresos y gastos generales se eliminaron de esta vista
     const totalExpenses = expenses.reduce((sum, exp) => sum + exp.amount, 0);
-    const totalIncome = income.reduce((sum, inc) => sum + inc.amount, 0);
-    return totalIncome - totalExpenses;
-  };
-
-  const handleMarkAsSettled = async (expenseId) => {
-    if (!db || !wallet?.id) return;
-    try {
-      await updateDoc(doc(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/expenses`, expenseId), {
-        isSettled: true,
-      });
-      showMessage("Gasto de tarjeta marcado como saldado.", "success");
-    } catch (error) {
-      console.error("Error al saldar el gasto de tarjeta:", error);
-      showMessage("Error al saldar el gasto de tarjeta.", "danger");
-    }
+    // El saldo actual de la billetera comunitaria no es relevante para el usuario, ya que no maneja un "fondo"
+    // sino que es un registro de deudas. Por lo tanto, este cálculo podría ser removido o ajustado.
+    // Lo mantengo por ahora, pero su relevancia es menor.
+    return -totalExpenses; // Representa el total gastado por la comunidad
   };
 
   // Lógica de cálculo de reembolsos para billetera comunitaria
@@ -797,6 +816,16 @@ function CommunityWalletDetail({ wallet, onBack }) {
         actualParticipantsInvolved.forEach(pId => {
           balances[pId] -= share;
         });
+      }
+    });
+
+    // Ajustar balances con reembolsos saldados
+    settledReimbursements.forEach(settled => {
+      if (balances[settled.fromId]) {
+        balances[settled.fromId] += settled.amount;
+      }
+      if (balances[settled.toId]) {
+        balances[settled.toId] -= settled.amount;
       }
     });
 
@@ -894,6 +923,71 @@ function CommunityWalletDetail({ wallet, onBack }) {
     showMessage("Gastos de tarjeta exportados a Excel.", "success");
   };
 
+  // Funciones para Modificar y Duplicar Gastos
+  const handleModifyExpense = (expense) => {
+    setExpenseToModify(expense);
+    setShowModifyExpenseModal(true);
+  };
+
+  const handleDuplicateExpense = (expense) => {
+    setExpenseToDuplicate(expense);
+    setShowDuplicateExpenseModal(true);
+  };
+
+  const handleSaveModifiedExpense = async (modifiedExpense) => {
+    if (!db || !wallet?.id || !modifiedExpense?.id) return;
+
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/expenses`, modifiedExpense.id), {
+        description: modifiedExpense.description,
+        amount: parseFloat(modifiedExpense.amount),
+        // Puedes añadir más campos a modificar aquí
+        lastModifiedDate: serverTimestamp(),
+      });
+      showMessage("Gasto modificado exitosamente.", "success");
+      setShowModifyExpenseModal(false);
+      setExpenseToModify(null);
+    } catch (error) {
+      console.error("Error al modificar gasto:", error);
+      showMessage("Error al modificar el gasto.", "danger");
+    }
+  };
+
+  // Funciones para Multi-borrado
+  const handleSelectExpenseForDeletion = (expenseId, isChecked) => {
+    if (isChecked) {
+      setSelectedExpensesToDelete(prev => [...prev, expenseId]);
+    } else {
+      setSelectedExpensesToDelete(prev => prev.filter(id => id !== expenseId));
+    }
+  };
+
+  const handleDeleteSelectedExpenses = () => {
+    if (selectedExpensesToDelete.length === 0) {
+      showMessage("No hay gastos seleccionados para eliminar.", "info");
+      return;
+    }
+    setShowDeleteSelectedExpensesModal(true);
+  };
+
+  const confirmDeleteSelectedExpenses = async () => {
+    if (!db || !wallet?.id || selectedExpensesToDelete.length === 0) return;
+
+    try {
+      const batch = writeBatch(db);
+      selectedExpensesToDelete.forEach(expenseId => {
+        batch.delete(doc(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/expenses`, expenseId));
+      });
+      await batch.commit();
+      showMessage("Gastos seleccionados eliminados exitosamente.", "success");
+      setSelectedExpensesToDelete([]); // Limpiar selección
+      setShowDeleteSelectedExpensesModal(false);
+    } catch (error) {
+      console.error("Error al eliminar gastos seleccionados:", error);
+      showMessage("Error al eliminar los gastos seleccionados.", "danger");
+    }
+  };
+
 
   if (loadingData) {
     return (
@@ -945,11 +1039,8 @@ function CommunityWalletDetail({ wallet, onBack }) {
         </div>
       </TailwindCard>
 
-      {/* Botones para Añadir Ingreso/Gasto */}
+      {/* Botones para Añadir Gasto */}
       <div className="text-center mb-6 flex flex-col sm:flex-row justify-center gap-4">
-        <TailwindButton variant="success" className="px-6" onClick={() => setShowAddIncomeModal(true)}>
-          Añadir Ingreso
-        </TailwindButton>
         <TailwindButton variant="danger" className="px-6" onClick={() => setShowAddExpenseModal(true)}>
           Añadir Gasto
         </TailwindButton>
@@ -988,247 +1079,144 @@ function CommunityWalletDetail({ wallet, onBack }) {
         {/* Gastos de Tarjeta de Crédito Pendientes */}
         <div>
           <h4 className="text-lg font-semibold text-gray-700 mb-3 border-b pb-2">Gastos de Tarjeta de Crédito Pendientes</h4>
-          {expenses.filter(exp => exp.type === 'credit_card' && !exp.isSettled).length === 0 ? (
+          {expenses.filter(exp => exp.type === 'credit_card').length === 0 ? ( // Removed !exp.isSettled filter here
             <p className="text-center text-gray-500 p-3 bg-gray-50 rounded-lg">No hay gastos de tarjeta de crédito pendientes en esta billetera.</p>
           ) : (
-            <ul className="divide-y divide-gray-200">
-              {expenses.filter(exp => exp.type === 'credit_card' && !exp.isSettled).map((expense) => (
-                <li key={expense.id} className="bg-white shadow-sm rounded-lg mb-2 p-4 border border-blue-200">
-                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
-                    <span className="font-medium text-gray-800">{expense.description}</span>
-                    <span className="font-bold text-xl text-red-600 mt-2 sm:mt-0">-${expense.amount.toFixed(2)}</span>
-                  </div>
-                  <p className="text-gray-600 text-sm mt-1">
-                    Pagado por: <span className="font-semibold">{members.find(m => m.id === expense.payerId)?.name || 'Desconocido'}</span>
-                  </p>
-                  <p className="text-gray-500 text-xs mt-1">
-                    Tarjeta: <span className="font-semibold">{expense.bank} - {expense.cardType}</span>
-                  </p>
-                  {expense.splitDetails && Object.keys(expense.splitDetails).length > 0 && (
-                    <div className="text-xs text-gray-500 mt-2">
-                      Detalle de Responsabilidad:
-                      <ul className="list-disc list-inside ml-2">
-                        {Object.entries(expense.splitDetails).map(([memberId, value]) => (
-                          <li key={memberId}>
-                            {members.find(m => m.id === memberId)?.name || memberId}: {expense.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
-                            {memberId === userId && <span className="font-bold text-blue-600"> (Tú)</span>}
-                          </li>
-                        ))}
-                      </ul>
+            <>
+              <div className="flex justify-end mb-3">
+                <TailwindButton
+                  variant="danger"
+                  className="px-4 py-2 text-sm"
+                  onClick={handleDeleteSelectedExpenses}
+                  disabled={selectedExpensesToDelete.length === 0}
+                >
+                  Eliminar Seleccionados ({selectedExpensesToDelete.length})
+                </TailwindButton>
+              </div>
+              <ul className="divide-y divide-gray-200">
+                {expenses.filter(exp => exp.type === 'credit_card').map((expense) => ( // Removed !exp.isSettled filter here
+                  <li key={expense.id} className="bg-white shadow-sm rounded-lg mb-2 p-4 border border-blue-200">
+                    <div className="flex items-center mb-2">
+                      <TailwindCheckbox
+                        id={`expense-${expense.id}`}
+                        checked={selectedExpensesToDelete.includes(expense.id)}
+                        onChange={(e) => handleSelectExpenseForDeletion(expense.id, e.target.checked)}
+                        className="mr-3"
+                      />
+                      <span className="font-medium text-gray-800 flex-grow">{expense.description}</span>
+                      <span className="font-bold text-xl text-red-600">-${expense.amount.toFixed(2)}</span>
                     </div>
-                  )}
-                  {expense.isInstallment && (
-                    <p className="text-purple-600 font-medium text-xs mt-2">
-                      En cuotas: {expense.totalInstallments} cuotas de ${expense.installmentAmount.toFixed(2)} (hasta {expense.installmentEndDate ? new Date(expense.installmentEndDate.seconds * 1000).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' }) : 'N/A'})
+                    <p className="text-gray-600 text-sm mt-1">
+                      Pagado por: <span className="font-semibold">{members.find(m => m.id === expense.payerId)?.name || 'Desconocido'}</span>
                     </p>
-                  )}
-                  <p className="text-gray-500 text-xs mt-2">
-                    Fecha: {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
-                  </p>
-                  <div className="text-right mt-3">
-                    <TailwindButton
-                      variant="info"
-                      className="px-4 py-2 text-sm"
-                      onClick={() => handleMarkAsSettled(expense.id)}
-                    >
-                      Marcar como Saldado
-                    </TailwindButton>
-                  </div>
-                </li>
-              ))}
-            </ul>
+                    <p className="text-gray-500 text-xs mt-1">
+                      Tarjeta: <span className="font-semibold">{expense.bank} - {expense.cardType}</span>
+                    </p>
+                    {expense.splitDetails && Object.keys(expense.splitDetails).length > 0 && (
+                      <div className="text-xs text-gray-500 mt-2">
+                        Detalle de Responsabilidad:
+                        <ul className="list-disc list-inside ml-2">
+                          {Object.entries(expense.splitDetails).map(([memberId, value]) => (
+                            <li key={memberId}>
+                              {members.find(m => m.id === memberId)?.name || memberId}: {expense.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
+                              {memberId === userId && <span className="font-bold text-blue-600"> (Tú)</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {expense.isInstallment && (
+                      <p className="text-purple-600 font-medium text-xs mt-2">
+                        En cuotas: {expense.totalInstallments} cuotas de ${expense.installmentAmount.toFixed(2)} (hasta {expense.installmentEndDate ? new Date(expense.installmentEndDate.seconds * 1000).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' }) : 'N/A'})
+                      </p>
+                    )}
+                    <p className="text-gray-500 text-xs mt-2">
+                      Fecha: {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
+                    </p>
+                    <div className="flex justify-end gap-2 mt-3">
+                      <TailwindButton variant="info" className="px-3 py-1 text-sm" onClick={() => handleModifyExpense(expense)}>
+                        Modificar
+                      </TailwindButton>
+                      <TailwindButton variant="secondary" className="px-3 py-1 text-sm" onClick={() => handleDuplicateExpense(expense)}>
+                        Duplicar
+                      </TailwindButton>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
         </div>
       </TailwindCard>
 
-
-      {/* Lista de Ingresos */}
-      <TailwindCard className="bg-yellow-50 p-6 mb-6 shadow-sm rounded-lg border-0">
-        <h3 className="text-xl font-semibold text-gray-800 mb-4">Ingresos</h3>
-        {income.length === 0 ? (
-          <p className="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">No hay ingresos registrados.</p>
-        ) : (
-          <ul className="divide-y divide-gray-200">
-            {income.map((item) => (
-              <li key={item.id} className="flex flex-col sm:flex-row justify-content-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2">
-                <div>
-                  <span className="font-medium text-gray-800">{item.description}</span>
-                  <p className="text-gray-500 text-xs mt-1">
-                    Fecha: {item.date ? new Date(item.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
-                  </p>
-                </div>
-                <span className="font-bold text-xl text-green-600 mt-2 sm:mt-0">+${item.amount.toFixed(2)}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </TailwindCard>
-
-      {/* Lista de Gastos */}
-      <TailwindCard className="bg-red-50 p-6 mb-6 shadow-sm rounded-lg border-0">
-        <h3 className="text-xl font-semibold text-gray-800 mb-4">Gastos</h3>
-        {expenses.length === 0 ? (
-          <p className="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">No hay gastos registrados.</p>
-        ) : (
-          <ul className="divide-y divide-gray-200">
-            {expenses.map((expense) => (
-              <li key={expense.id} className="bg-white shadow-sm rounded-lg mb-2 p-4">
-                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
-                  <span className="font-medium text-gray-800">{expense.description}</span>
-                  <span className="font-bold text-xl text-red-600 mt-2 sm:mt-0">-${expense.amount.toFixed(2)}</span>
-                </div>
-                <p className="text-gray-600 text-sm mt-1">
-                  Pagado por: <span className="font-semibold">{members.find(m => m.id === expense.payerId)?.name || 'Desconocido'}</span>
-                </p>
-                <p className="text-gray-500 text-xs mt-1">
-                  Tipo: {expense.type === 'credit_card' ? `Tarjeta de Crédito (${expense.bank} - ${expense.cardType})` : 'Débito/Efectivo'}
-                </p>
-                {expense.splitType && (
-                  <p className="text-gray-500 text-xs mt-1">
-                    División: {expense.splitType === 'equal' ? 'Partes Iguales' :
-                                expense.splitType === 'amount' ? 'Por Montos' : 'Por Porcentajes'}
-                  </p>
-                )}
-                {expense.splitDetails && Object.keys(expense.splitDetails).length > 0 && (
-                  <div className="text-xs text-gray-500 mt-2">
-                    Detalle:
-                    <ul className="list-disc list-inside ml-2">
-                      {Object.entries(expense.splitDetails).map(([memberId, value]) => (
-                        <li key={memberId}>
-                          {members.find(m => m.id === memberId)?.name || memberId}: {expense.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {expense.isInstallment && (
-                  <p className="text-purple-600 font-medium text-xs mt-2">
-                    En cuotas: {expense.totalInstallments} cuotas de ${expense.installmentAmount.toFixed(2)} (hasta {expense.installmentEndDate ? new Date(expense.installmentEndDate.seconds * 1000).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' }) : 'N/A'})
-                  </p>
-                )}
-                {expense.type === 'credit_card' && !expense.isSettled && (
-                  <div className="text-right mt-3">
-                    <TailwindButton
-                      variant="info"
-                      className="px-4 py-2 text-sm"
-                      onClick={() => handleMarkAsSettled(expense.id)}
-                    >
-                      Marcar como Saldado
-                    </TailwindButton>
-                  </div>
-                )}
-                <p className="text-gray-500 text-xs mt-2">
-                  Fecha: {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
-                </p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </TailwindCard>
-
       {/* Modales */}
-      <AddIncomeModal show={showAddIncomeModal} walletId={wallet.id} onClose={() => setShowAddIncomeModal(false)} />
       <AddCommunityExpenseModal show={showAddExpenseModal} walletId={wallet.id} members={members} onClose={() => setShowAddExpenseModal(false)} />
-      <ReimbursementDetailModal show={showReimbursementDetail} debt={selectedDebt} expenses={selectedDebt ? getExpensesForDebt(selectedDebt) : []} participants={members} onClose={() => setShowReimbursementDetail(false)} />
+      <ReimbursementDetailModal show={showReimbursementDetail} walletId={wallet.id} debt={selectedDebt} expenses={selectedDebt ? getExpensesForDebt(selectedDebt) : []} participants={members} onClose={() => setShowReimbursementDetail(false)} />
       <InviteMemberModal show={showInviteModal} walletId={wallet.id} walletName={wallet.name} onClose={() => setShowInviteModal(false)} />
+
+      {expenseToModify && (
+        <ModifyCommunityExpenseModal
+          show={showModifyExpenseModal}
+          onClose={() => setShowModifyExpenseModal(false)}
+          expense={expenseToModify}
+          members={members}
+          onSave={handleSaveModifiedExpense}
+        />
+      )}
+
+      {expenseToDuplicate && (
+        <AddCommunityExpenseModal
+          show={showDuplicateExpenseModal}
+          walletId={wallet.id}
+          members={members}
+          onClose={() => setShowDuplicateExpenseModal(false)}
+          initialExpenseData={expenseToDuplicate} // Pass data for duplication
+        />
+      )}
+
+      {showDeleteSelectedExpensesModal && (
+        <DeleteWalletConfirmationModal // Reusing the confirmation modal for generic deletion
+          show={showDeleteSelectedExpensesModal}
+          onClose={() => setShowDeleteSelectedExpensesModal(false)}
+          onConfirm={confirmDeleteSelectedExpenses}
+          walletName={`${selectedExpensesToDelete.length} gastos seleccionados`} // Custom message
+        />
+      )}
     </TailwindCard>
   );
 }
 
-// Componente AddIncomeModal (Modal para Añadir Ingreso)
-function AddIncomeModal({ walletId, onClose, show }) {
-  const { db, userId, appId, showMessage } = useContext(FirebaseContext);
-  const [description, setDescription] = useState('');
-  const [amount, setAmount] = useState('');
-
-  const handleAddIncome = async (e) => {
-    e.preventDefault();
-    if (!description.trim() || !amount || parseFloat(amount) <= 0) {
-      showMessage("Por favor, completa la descripción y el monto válido.", "danger");
-      return;
-    }
-    if (!db || !userId) return;
-
-    try {
-      await addDoc(collection(db, `artifacts/${appId}/public/data/communityWallets/${walletId}/income`), {
-        description: description.trim(),
-        amount: parseFloat(amount),
-        contributorId: userId,
-        date: serverTimestamp(),
-      });
-      showMessage("Ingreso añadido exitosamente!", "success");
-      onClose();
-    } catch (error) {
-      console.error("Error al añadir ingreso:", error);
-      showMessage("Error al añadir el ingreso.", "danger");
-    }
-  };
-
-  return (
-    <TailwindModal show={show} onClose={onClose} title="Añadir Nuevo Ingreso">
-      <form onSubmit={handleAddIncome}>
-        <TailwindInput
-          label="Descripción:"
-          type="text"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          required
-        />
-        <TailwindInput
-          label="Monto:"
-          type="number"
-          value={amount}
-          onChange={(e) => setAmount(e.target.value)}
-          step="0.01"
-          required
-          inputMode="numeric" // Teclado numérico
-          pattern="[0-9]*"   // Patrón para números
-        />
-        <div className="flex justify-end gap-2 mt-6">
-          <TailwindButton variant="secondary" onClick={onClose}>
-            Cancelar
-          </TailwindButton>
-          <TailwindButton variant="success" type="submit">
-            Guardar Ingreso
-          </TailwindButton>
-        </div>
-      </form>
-    </TailwindModal>
-  );
-}
-
 // Componente AddCommunityExpenseModal (Modal para Añadir Gasto Comunitario)
-function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
+function AddCommunityExpenseModal({ walletId, members, onClose, show, initialExpenseData = null }) {
   const { db, userId, appId, showMessage } = useContext(FirebaseContext);
-  const [description, setDescription] = useState('');
-  const [amount, setAmount] = useState('');
-  const [payerId, setPayerId] = useState(userId);
-  const [expenseType, setExpenseType] = useState('debit_cash');
-  const [bank, setBank] = useState('');
-  const [cardType, setCardType] = useState('');
-  const [splitType, setSplitType] = useState('equal');
-  const [splitDetails, setSplitDetails] = useState({});
-  const [selectedParticipantsForExpense, setSelectedParticipantsForExpense] = useState(members.map(m => m.id));
+  const [description, setDescription] = useState(initialExpenseData?.description || '');
+  const [amount, setAmount] = useState(initialExpenseData?.amount || '');
+  const [payerId, setPayerId] = useState(initialExpenseData?.payerId || userId);
+  const expenseType = 'credit_card'; // Fixed to credit_card as per user request
+  const [bank, setBank] = useState(initialExpenseData?.bank || '');
+  const [cardType, setCardType] = useState(initialExpenseData?.cardType || '');
+  const [splitType, setSplitType] = useState(initialExpenseData?.splitType || 'equal');
+  const [splitDetails, setSplitDetails] = useState(initialExpenseData?.splitDetails || {});
+  const [selectedParticipantsForExpense, setSelectedParticipantsForExpense] = useState(initialExpenseData?.splitDetails ? Object.keys(initialExpenseData.splitDetails) : members.map(m => m.id));
   const [creditCardBanks, setCreditCardBanks] = useState([]);
-  const [isInstallment, setIsInstallment] = useState(false);
-  const [totalInstallments, setTotalInstallments] = useState('');
+  const [isInstallment, setIsInstallment] = useState(initialExpenseData?.isInstallment || false);
+  const [totalInstallments, setTotalInstallments] = useState(initialExpenseData?.totalInstallments || '');
 
-  // Limpiar el formulario al abrir/cerrar el modal
+  // Limpiar el formulario al abrir/cerrar el modal o cuando se duplica
   useEffect(() => {
     if (show) {
-      setDescription('');
-      setAmount('');
-      setPayerId(userId);
-      setExpenseType('debit_cash');
-      setBank('');
-      setCardType('');
-      setSplitType('equal');
-      setSplitDetails({});
-      setSelectedParticipantsForExpense(members.map(m => m.id));
-      setIsInstallment(false);
-      setTotalInstallments('');
+      setDescription(initialExpenseData?.description || '');
+      setAmount(initialExpenseData?.amount || '');
+      setPayerId(initialExpenseData?.payerId || userId);
+      setBank(initialExpenseData?.bank || '');
+      setCardType(initialExpenseData?.cardType || '');
+      setSplitType(initialExpenseData?.splitType || 'equal');
+      setSplitDetails(initialExpenseData?.splitDetails || {});
+      setSelectedParticipantsForExpense(initialExpenseData?.splitDetails ? Object.keys(initialExpenseData.splitDetails) : members.map(m => m.id));
+      setIsInstallment(initialExpenseData?.isInstallment || false);
+      setTotalInstallments(initialExpenseData?.totalInstallments || '');
     }
-  }, [show, userId, members]);
+  }, [show, userId, members, initialExpenseData]);
 
 
   useEffect(() => {
@@ -1346,13 +1334,13 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
       description: description.trim(),
       amount: totalAmount,
       payerId: payerId,
-      type: expenseType,
-      bank: expenseType === 'credit_card' ? bank.trim() : null,
-      cardType: expenseType === 'credit_card' ? cardType.trim() : null,
+      type: expenseType, // Always credit_card now
+      bank: bank.trim(), // Bank is now mandatory
+      cardType: cardType.trim(), // CardType is now mandatory
       date: serverTimestamp(),
       splitType: splitType,
       splitDetails: finalSplitDetails,
-      isSettled: false,
+      isSettled: false, // isSettled always false for new expenses
       isInstallment: isInstallment,
       totalInstallments: isInstallment ? parseInt(totalInstallments) : null, // Ensure integer
       installmentAmount: isInstallment ? installmentAmount : null,
@@ -1397,19 +1385,27 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
           ))}
         </TailwindSelect>
 
-        <TailwindSelect label="Tipo de Gasto:" value={expenseType} onChange={(e) => setExpenseType(e.target.value)}>
-          <option value="debit_cash">Débito/Efectivo</option>
-          <option value="credit_card">Tarjeta de Crédito</option>
+        {/* Expense Type is now fixed to Credit Card */}
+        <div className="mb-4">
+          <label className="block text-gray-700 text-sm font-bold mb-2">Tipo de Gasto:</label>
+          <p className="shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight bg-gray-100 cursor-not-allowed">
+            Tarjeta de Crédito
+          </p>
+        </div>
+
+        <TailwindSelect label="Banco:" value={bank} onChange={handleBankChange} required>
+          <option value="">Selecciona un banco</option>
+          {creditCardBanks.map((b, index) => (
+            <option key={index} value={b.name}>{b.name}</option>
+          ))}
         </TailwindSelect>
 
-        {expenseType === 'credit_card' && (
-          <TailwindSelect label="Banco:" value={bank} onChange={handleBankChange} required>
-            <option value="">Selecciona un banco</option>
-            {creditCardBanks.map((b, index) => (
-              <option key={index} value={b.name}>{b.name}</option>
-            ))}
-          </TailwindSelect>
-        )}
+        <div className="mb-4">
+          <label className="block text-gray-700 text-sm font-bold mb-2">Tipo de Tarjeta:</label>
+          <p className="shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight bg-gray-100 cursor-not-allowed">
+            {cardType || 'Automático'}
+          </p>
+        </div>
 
         <div className="mb-4">
           <label className="block text-gray-700 text-sm font-bold mb-2">Participantes en este gasto:</label>
@@ -1489,8 +1485,298 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
   );
 }
 
+// New Component: ModifyCommunityExpenseModal
+function ModifyCommunityExpenseModal({ show, onClose, expense, members, onSave }) {
+  const { db, userId, appId, showMessage } = useContext(FirebaseContext);
+  const [description, setDescription] = useState(expense.description);
+  const [amount, setAmount] = useState(expense.amount);
+  const [payerId, setPayerId] = useState(expense.payerId);
+  const [bank, setBank] = useState(expense.bank || '');
+  const [cardType, setCardType] = useState(expense.cardType || '');
+  const [splitType, setSplitType] = useState(expense.splitType || 'equal');
+  const [splitDetails, setSplitDetails] = useState(expense.splitDetails || {});
+  const [selectedParticipantsForExpense, setSelectedParticipantsForExpense] = useState(expense.splitDetails ? Object.keys(expense.splitDetails) : members.map(m => m.id));
+  const [creditCardBanks, setCreditCardBanks] = useState([]);
+  const [isInstallment, setIsInstallment] = useState(expense.isInstallment || false);
+  const [totalInstallments, setTotalInstallments] = useState(expense.totalInstallments || '');
+
+  useEffect(() => {
+    if (db && userId) {
+      const q = query(collection(db, `artifacts/${appId}/users/${userId}/banks`), where('type', '==', 'credit_card'));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const fetchedBanks = snapshot.docs.map(doc => ({name: doc.data().name, cardType: doc.data().cardType || ''}));
+        setCreditCardBanks(fetchedBanks);
+      }, (error) => {
+        console.error("Error al obtener bancos de tarjeta de crédito:", error);
+      });
+      return () => unsubscribe();
+    }
+  }, [db, userId, appId]);
+
+  useEffect(() => {
+    const initialSplitDetails = {};
+    const totalAmt = parseFloat(amount) || 0;
+    const numSelected = selectedParticipantsForExpense.length;
+
+    members.forEach(member => {
+      if (selectedParticipantsForExpense.includes(member.id)) {
+        initialSplitDetails[member.id] = splitType === 'equal' && numSelected > 0 ? (totalAmt / numSelected) : 0;
+      } else {
+        initialSplitDetails[member.id] = 0;
+      }
+    });
+    setSplitDetails(initialSplitDetails);
+  }, [members, splitType, amount, selectedParticipantsForExpense]);
+
+  const handleSplitDetailChange = (memberId, value) => {
+    setSplitDetails(prev => ({ ...prev, [memberId]: parseFloat(value) || 0 }));
+  };
+
+  const handleParticipantSelection = (memberId, isChecked) => {
+    if (isChecked) {
+      setSelectedParticipantsForExpense(prev => [...prev, memberId]);
+    } else {
+      setSelectedParticipantsForExpense(prev => prev.filter(id => id !== memberId));
+    }
+  };
+
+  const handleBankChange = (e) => {
+    const selectedBankName = e.target.value;
+    setBank(selectedBankName);
+    const selectedBank = creditCardBanks.find(b => b.name === selectedBankName);
+    if (selectedBank) {
+      setCardType(selectedBank.cardType);
+    } else {
+      setCardType('');
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!description.trim() || !amount || parseFloat(amount) <= 0) {
+      showMessage("Por favor, completa la descripción y el monto válido.", "danger");
+      return;
+    }
+    if (selectedParticipantsForExpense.length === 0) {
+      showMessage("Debes seleccionar al menos un participante para este gasto.", "danger");
+      return;
+    }
+    if (expense.type === 'credit_card' && !bank.trim()) {
+      showMessage("Para gastos con tarjeta de crédito, selecciona un banco.", "danger");
+      return;
+    }
+    if (isInstallment && (!totalInstallments || parseInt(totalInstallments) <= 0)) {
+      showMessage("Para gastos en cuotas, especifica un número válido de cuotas.", "danger");
+      return;
+    }
+
+    let finalSplitDetails = {};
+    const totalAmount = parseFloat(amount);
+    const actualParticipants = members.filter(m => selectedParticipantsForExpense.includes(m.id));
+
+    if (splitType === 'equal') {
+      const share = totalAmount / actualParticipants.length;
+      actualParticipants.forEach(member => {
+        finalSplitDetails[member.id] = share;
+      });
+    } else if (splitType === 'amount') {
+      const sumOfAmounts = Object.values(splitDetails).reduce((sum, val) => sum + val, 0);
+      if (Math.abs(sumOfAmounts - totalAmount) > 0.01) {
+        showMessage("La suma de los montos no coincide con el monto total del gasto.", "danger");
+        return;
+      }
+      finalSplitDetails = splitDetails;
+    } else if (splitType === 'percentage') {
+      const sumOfPercentages = Object.values(splitDetails).reduce((sum, val) => sum + val, 0);
+      if (Math.abs(sumOfPercentages - 100) > 0.01) {
+        showMessage("La suma de los porcentajes debe ser 100%.", "danger");
+        return;
+      }
+      actualParticipants.forEach(member => {
+        finalSplitDetails[member.id] = (splitDetails[member.id] / 100) * totalAmount;
+      });
+    }
+
+    let installmentAmount = null;
+    let installmentEndDate = null;
+
+    if (isInstallment) {
+      const numInstallments = parseInt(totalInstallments);
+      installmentAmount = totalAmount / numInstallments;
+
+      const today = new Date();
+      const endDate = new Date(today.getFullYear(), today.getMonth() + numInstallments, today.getDate());
+      installmentEndDate = endDate;
+    }
+
+    const modifiedExpenseData = {
+      ...expense, // Keep existing fields
+      description: description.trim(),
+      amount: totalAmount,
+      payerId: payerId,
+      bank: expense.type === 'credit_card' ? bank.trim() : null,
+      cardType: expense.type === 'credit_card' ? cardType.trim() : null,
+      splitType: splitType,
+      splitDetails: finalSplitDetails,
+      isInstallment: isInstallment,
+      totalInstallments: isInstallment ? parseInt(totalInstallments) : null,
+      installmentAmount: isInstallment ? installmentAmount : null,
+      installmentEndDate: isInstallment ? installmentEndDate : null,
+    };
+    onSave(modifiedExpenseData);
+  };
+
+  return (
+    <TailwindModal show={show} onClose={onClose} title="Modificar Gasto Comunitario">
+      <form onSubmit={handleSubmit}>
+        <TailwindInput
+          label="Descripción:"
+          type="text"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          required
+        />
+        <TailwindInput
+          label="Monto Total:"
+          type="number"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          step="0.01"
+          required
+          inputMode="numeric"
+          pattern="[0-9]*"
+        />
+        <TailwindSelect label="Pagado por:" value={payerId} onChange={(e) => setPayerId(e.target.value)}>
+          {members.map(m => (
+            <option key={m.id} value={m.id}>{m.name}</option>
+          ))}
+        </TailwindSelect>
+
+        {expense.type === 'credit_card' && (
+          <>
+            <TailwindSelect label="Banco:" value={bank} onChange={handleBankChange} required>
+              <option value="">Selecciona un banco</option>
+              {creditCardBanks.map((b, index) => (
+                <option key={index} value={b.name}>{b.name}</option>
+              ))}
+            </TailwindSelect>
+            <div className="mb-4">
+              <label className="block text-gray-700 text-sm font-bold mb-2">Tipo de Tarjeta:</label>
+              <p className="shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight bg-gray-100 cursor-not-allowed">
+                {cardType || 'Automático'}
+              </p>
+            </div>
+          </>
+        )}
+
+        <div className="mb-4">
+          <label className="block text-gray-700 text-sm font-bold mb-2">Participantes en este gasto:</label>
+          <div className="grid gap-2 p-3 border border-gray-300 rounded-lg bg-gray-50">
+            {members.map(member => (
+              <TailwindCheckbox
+                key={member.id}
+                id={`modify-member-${member.id}`}
+                label={member.name}
+                checked={selectedParticipantsForExpense.includes(member.id)}
+                onChange={(e) => handleParticipantSelection(member.id, e.target.checked)}
+              />
+            ))}
+          </div>
+        </div>
+
+        <TailwindSelect label="Método de División:" value={splitType} onChange={(e) => setSplitType(e.target.value)}>
+          <option value="equal">Partes Iguales</option>
+          <option value="amount">Por Montos</option>
+          <option value="percentage">Por Porcentajes</option>
+        </TailwindSelect>
+
+        {splitType !== 'equal' && (
+          <div className="mb-4 p-3 border border-gray-300 rounded-lg bg-gray-50">
+            <p className="font-semibold mb-3">Detalle de División:</p>
+            {members.filter(m => selectedParticipantsForExpense.includes(m.id)).map(member => (
+              <div key={member.id} className="flex items-center mb-2">
+                <label className="w-1/3 text-sm text-gray-700">{member.name}:</label>
+                <div className="w-2/3 flex items-center">
+                  <TailwindInput
+                    type="number"
+                    value={splitDetails[member.id] || ''}
+                    onChange={(e) => handleSplitDetailChange(member.id, e.target.value)}
+                    step="0.01"
+                    placeholder={splitType === 'percentage' ? '%' : '$'}
+                    className="flex-grow mr-2"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                  />
+                  {splitType === 'percentage' && <span className="text-gray-600">%</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <TailwindCheckbox
+          id="modify-isInstallment"
+          label="Gasto en cuotas"
+          checked={isInstallment}
+          onChange={(e) => setIsInstallment(e.target.checked)}
+        />
+
+        {isInstallment && (
+          <TailwindInput
+            label="Número de cuotas:"
+            type="number"
+            value={totalInstallments}
+            onChange={(e) => setTotalInstallments(e.target.value)}
+            min="1"
+            required={isInstallment}
+            inputMode="numeric"
+            pattern="[0-9]*"
+          />
+        )}
+
+        <div className="flex justify-end gap-2 mt-6">
+          <TailwindButton variant="secondary" onClick={onClose}>
+            Cancelar
+          </TailwindButton>
+          <TailwindButton variant="success" type="submit">
+            Guardar Cambios
+          </TailwindButton>
+        </div>
+      </form>
+    </TailwindModal>
+  );
+}
+
+
 // Componente ReimbursementDetailModal (Modal de Detalle de Reembolso)
-function ReimbursementDetailModal({ debt, expenses, participants, onClose, show }) {
+function ReimbursementDetailModal({ debt, expenses, participants, onClose, show, walletId }) {
+  const { db, appId, showMessage } = useContext(FirebaseContext);
+
+  const handleMarkReimbursementAsSettled = async () => {
+    if (!db || !walletId || !debt) {
+      showMessage("Error: Datos no disponibles para saldar el reembolso.", "danger");
+      return;
+    }
+
+    try {
+      // **Corrección para el punto 6 del usuario:**
+      // Este botón ahora SÓLO registra que el reembolso entre miembros se ha saldado.
+      // NO afecta el estado 'isSettled' de los gastos originales en la billetera comunitaria,
+      // porque eso afectaría el total de la tarjeta en Gastos Futuros.
+      await addDoc(collection(db, `artifacts/${appId}/public/data/communityWallets/${walletId}/settledReimbursements`), {
+        fromId: debt.fromId,
+        toId: debt.toId,
+        amount: debt.amount,
+        dateSettled: serverTimestamp(),
+      });
+      showMessage("Reembolso marcado como saldado.", "success");
+      onClose(); // Cerrar el modal después de saldar
+    } catch (error) {
+      console.error("Error al saldar reembolso:", error);
+      showMessage("Error al saldar el reembolso.", "danger");
+    }
+  };
+
   return (
     <TailwindModal show={show} onClose={onClose} title={`Detalle de Deuda: ${debt?.from} le debe a ${debt?.to}`}>
       <p className="text-center text-3xl font-bold text-green-600 mb-6 p-3 bg-green-100 rounded-lg">Monto Total: ${debt?.amount.toFixed(2)}</p>
@@ -1528,7 +1814,10 @@ function ReimbursementDetailModal({ debt, expenses, participants, onClose, show 
         )}
       </div>
 
-      <div className="flex justify-center mt-6">
+      <div className="flex justify-center gap-4 mt-6">
+        <TailwindButton variant="success" onClick={handleMarkReimbursementAsSettled}>
+          Marcar como Saldado
+        </TailwindButton>
         <TailwindButton variant="primary" onClick={onClose}>
           Cerrar
         </TailwindButton>
@@ -1539,7 +1828,7 @@ function ReimbursementDetailModal({ debt, expenses, participants, onClose, show 
 
 // Componente PersonalWallet (Billetera Personal)
 function PersonalWallet() {
-  const { db, userId, appId, showMessage } = useContext(FirebaseContext);
+  const { db, userId, userName, appId, showMessage } = useContext(FirebaseContext);
   const [transactions, setTransactions] = useState([]);
   const [description, setDescription] = useState('');
   const [amount, setAmount] = useState('');
@@ -1550,6 +1839,17 @@ function PersonalWallet() {
   const [showTransferModal, setShowTransferModal] = useState(false);
   const [allCommunityWallets, setAllCommunityWallets] = useState([]);
   const [communityMembers, setCommunityMembers] = useState([]);
+
+  // Estados para modificar y duplicar transacciones
+  const [showModifyTransactionModal, setShowModifyTransactionModal] = useState(false);
+  const [transactionToModify, setTransactionToModify] = useState(null);
+  const [showDuplicateTransactionModal, setShowDuplicateTransactionModal] = useState(false);
+  const [transactionToDuplicate, setTransactionToDuplicate] = useState(null);
+
+  // Estados para multi-borrado
+  const [selectedTransactionsToDelete, setSelectedTransactionsToDelete] = useState([]);
+  const [showDeleteSelectedTransactionsModal, setShowDeleteSelectedTransactionsModal] = useState(false);
+
 
   useEffect(() => {
     if (!db || !userId) return;
@@ -1698,7 +1998,6 @@ function PersonalWallet() {
         }
       });
 
-      const debts = [];
       const sortedBalances = Object.entries(balances).sort(([, a], [, b]) => a - b);
 
       let i = 0;
@@ -1737,6 +2036,73 @@ function PersonalWallet() {
   const currentBalance = calculateCurrentBalance();
   const accountBalances = getBalanceByAccount();
   const totalReimbursements = calculateTotalReimbursements();
+
+  // Funciones para Modificar y Duplicar Transacciones
+  const handleModifyTransaction = (transaction) => {
+    setTransactionToModify(transaction);
+    setShowModifyTransactionModal(true);
+  };
+
+  const handleDuplicateTransaction = (transaction) => {
+    setTransactionToDuplicate(transaction);
+    setShowDuplicateTransactionModal(true);
+  };
+
+  const handleSaveModifiedTransaction = async (modifiedTransaction) => {
+    if (!db || !userId || !modifiedTransaction?.id) return;
+
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`, modifiedTransaction.id), {
+        description: modifiedTransaction.description,
+        amount: parseFloat(modifiedTransaction.amount),
+        type: modifiedTransaction.type,
+        account: modifiedTransaction.account,
+        lastModifiedDate: serverTimestamp(),
+      });
+      showMessage("Transacción modificada exitosamente.", "success");
+      setShowModifyTransactionModal(false);
+      setTransactionToModify(null);
+    } catch (error) {
+      console.error("Error al modificar transacción:", error);
+      showMessage("Error al modificar la transacción.", "danger");
+    }
+  };
+
+  // Funciones para Multi-borrado
+  const handleSelectTransactionForDeletion = (transactionId, isChecked) => {
+    if (isChecked) {
+      setSelectedTransactionsToDelete(prev => [...prev, transactionId]);
+    } else {
+      setSelectedTransactionsToDelete(prev => prev.filter(id => id !== transactionId));
+    }
+  };
+
+  const handleDeleteSelectedTransactions = () => {
+    if (selectedTransactionsToDelete.length === 0) {
+      showMessage("No hay transacciones seleccionadas para eliminar.", "info");
+      return;
+    }
+    setShowDeleteSelectedTransactionsModal(true);
+  };
+
+  const confirmDeleteSelectedTransactions = async () => {
+    if (!db || !userId || selectedTransactionsToDelete.length === 0) return;
+
+    try {
+      const batch = writeBatch(db);
+      selectedTransactionsToDelete.forEach(transactionId => {
+        batch.delete(doc(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`, transactionId));
+      });
+      await batch.commit();
+      showMessage("Transacciones seleccionadas eliminadas exitosamente.", "success");
+      setSelectedTransactionsToDelete([]); // Limpiar selección
+      setShowDeleteSelectedTransactionsModal(false);
+    } catch (error) {
+      console.error("Error al eliminar transacciones seleccionadas:", error);
+      showMessage("Error al eliminar las transacciones seleccionadas.", "danger");
+    }
+  };
+
 
   if (loading) {
     return (
@@ -1845,33 +2211,237 @@ function PersonalWallet() {
         {transactions.length === 0 ? (
           <p className="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">No hay transacciones personales registradas.</p>
         ) : (
-          <ul className="divide-y divide-gray-200">
-            {transactions.map((item) => (
-              <li key={item.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2">
-                <div>
-                  <span className="font-medium text-gray-800">{item.description}</span>
+          <>
+            <div className="flex justify-end mb-3">
+              <TailwindButton
+                variant="danger"
+                className="px-4 py-2 text-sm"
+                onClick={handleDeleteSelectedTransactions}
+                disabled={selectedTransactionsToDelete.length === 0}
+              >
+                Eliminar Seleccionados ({selectedTransactionsToDelete.length})
+              </TailwindButton>
+            </div>
+            <ul className="divide-y divide-gray-200">
+              {transactions.map((item) => (
+                <li key={item.id} className="bg-white shadow-sm rounded-lg mb-2 p-4">
+                  <div className="flex items-center mb-2">
+                    <TailwindCheckbox
+                      id={`transaction-${item.id}`}
+                      checked={selectedTransactionsToDelete.includes(item.id)}
+                      onChange={(e) => handleSelectTransactionForDeletion(item.id, e.target.checked)}
+                      className="mr-3"
+                    />
+                    <span className="font-medium text-gray-800 flex-grow">{item.description}</span>
+                    <span className={`font-bold text-xl ${item.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
+                      ${item.amount.toFixed(2)}
+                    </span>
+                  </div>
                   <p className={`text-sm font-semibold mt-1 ${item.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
                     {item.type === 'income' ? 'Ingreso' : 'Gasto'} ({item.account})
                   </p>
-                </div>
-                <div className="text-right mt-2 sm:mt-0">
-                  <span className={`font-bold text-xl ${item.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
-                    ${item.amount.toFixed(2)}
-                  </span>
                   <p className="text-gray-500 text-xs mt-1">
                     Fecha: {item.date ? new Date(item.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
                   </p>
-                </div>
-              </li>
-            ))}
-          </ul>
+                  <div className="flex justify-end gap-2 mt-3">
+                    <TailwindButton variant="info" className="px-3 py-1 text-sm" onClick={() => handleModifyTransaction(item)}>
+                      Modificar
+                    </TailwindButton>
+                    <TailwindButton variant="secondary" className="px-3 py-1 text-sm" onClick={() => handleDuplicateTransaction(item)}>
+                      Duplicar
+                    </TailwindButton>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </>
         )}
       </TailwindCard>
 
       <TransferModal show={showTransferModal} moneyStorageBanks={moneyStorageBanks} onClose={() => setShowTransferModal(false)} />
+
+      {transactionToModify && (
+        <ModifyPersonalTransactionModal
+          show={showModifyTransactionModal}
+          onClose={() => setShowModifyTransactionModal(false)}
+          transaction={transactionToModify}
+          moneyStorageBanks={moneyStorageBanks}
+          onSave={handleSaveModifiedTransaction}
+        />
+      )}
+
+      {transactionToDuplicate && (
+        <AddPersonalTransactionModal // Reusing AddPersonalTransactionModal for duplication
+          show={showDuplicateTransactionModal}
+          onClose={() => setShowDuplicateTransactionModal(false)}
+          initialTransactionData={transactionToDuplicate}
+          moneyStorageBanks={moneyStorageBanks}
+        />
+      )}
+
+      {showDeleteSelectedTransactionsModal && (
+        <DeleteWalletConfirmationModal // Reusing the confirmation modal for generic deletion
+          show={showDeleteSelectedTransactionsModal}
+          onClose={() => setShowDeleteSelectedTransactionsModal(false)}
+          onConfirm={confirmDeleteSelectedTransactions}
+          walletName={`${selectedTransactionsToDelete.length} transacciones seleccionadas`} // Custom message
+        />
+      )}
     </TailwindCard>
   );
 }
+
+// New Component: AddPersonalTransactionModal (for duplication)
+function AddPersonalTransactionModal({ onClose, show, initialTransactionData = null, moneyStorageBanks }) {
+  const { db, userId, appId, showMessage } = useContext(FirebaseContext);
+  const [description, setDescription] = useState(initialTransactionData?.description || '');
+  const [amount, setAmount] = useState(initialTransactionData?.amount || '');
+  const [type, setType] = useState(initialTransactionData?.type || 'expense');
+  const [account, setAccount] = useState(initialTransactionData?.account || (moneyStorageBanks.length > 0 ? moneyStorageBanks[0] : 'Efectivo'));
+
+  useEffect(() => {
+    if (show) {
+      setDescription(initialTransactionData?.description || '');
+      setAmount(initialTransactionData?.amount || '');
+      setType(initialTransactionData?.type || 'expense');
+      setAccount(initialTransactionData?.account || (moneyStorageBanks.length > 0 ? moneyStorageBanks[0] : 'Efectivo'));
+    }
+  }, [show, initialTransactionData, moneyStorageBanks]);
+
+  const handleAddTransaction = async (e) => {
+    e.preventDefault();
+    if (!description.trim() || !amount || parseFloat(amount) <= 0) {
+      showMessage("Por favor, completa la descripción y el monto válido.", "danger");
+      return;
+    }
+    if (!db || !userId) return;
+
+    try {
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`), {
+        description: description.trim(),
+        amount: parseFloat(amount),
+        type: type,
+        account: account,
+        date: serverTimestamp(),
+      });
+      showMessage("Transacción personal añadida.", "success");
+      onClose();
+    } catch (error) {
+      console.error("Error al añadir transacción personal:", error);
+      showMessage("Error al añadir la transacción personal.", "danger");
+    }
+  };
+
+  return (
+    <TailwindModal show={show} onClose={onClose} title="Añadir Transacción Personal">
+      <form onSubmit={handleAddTransaction}>
+        <TailwindInput
+          label="Descripción:"
+          type="text"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          required
+        />
+        <TailwindInput
+          label="Monto:"
+          type="number"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          step="0.01"
+          required
+          inputMode="numeric"
+          pattern="[0-9]*"
+        />
+        <TailwindSelect label="Tipo:" value={type} onChange={(e) => setType(e.target.value)}>
+          <option value="expense">Gasto</option>
+          <option value="income">Ingreso</option>
+        </TailwindSelect>
+        <TailwindSelect label="Ubicación del Dinero:" value={account} onChange={(e) => setAccount(e.target.value)}>
+          {moneyStorageBanks.map((b, index) => (
+            <option key={index} value={b}>{b}</option>
+          ))}
+        </TailwindSelect>
+        <div className="flex justify-end gap-2 mt-6">
+          <TailwindButton variant="secondary" onClick={onClose}>
+            Cancelar
+          </TailwindButton>
+          <TailwindButton variant="success" type="submit">
+            Guardar Transacción
+          </TailwindButton>
+        </div>
+      </form>
+    </TailwindModal>
+  );
+}
+
+
+// New Component: ModifyPersonalTransactionModal
+function ModifyPersonalTransactionModal({ show, onClose, transaction, moneyStorageBanks, onSave }) {
+  const [description, setDescription] = useState(transaction.description);
+  const [amount, setAmount] = useState(transaction.amount);
+  const [type, setType] = useState(transaction.type);
+  const [account, setAccount] = useState(transaction.account);
+
+  useEffect(() => {
+    if (transaction) {
+      setDescription(transaction.description);
+      setAmount(transaction.amount);
+      setType(transaction.type);
+      setAccount(transaction.account);
+    }
+  }, [transaction]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!description.trim() || !amount || parseFloat(amount) <= 0) {
+      alert("Por favor, completa la descripción y el monto válido."); // Replace with TailwindAlert
+      return;
+    }
+    onSave({ ...transaction, description: description, amount: parseFloat(amount), type: type, account: account });
+  };
+
+  return (
+    <TailwindModal show={show} onClose={onClose} title="Modificar Transacción Personal">
+      <form onSubmit={handleSubmit}>
+        <TailwindInput
+          label="Descripción:"
+          type="text"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          required
+        />
+        <TailwindInput
+          label="Monto:"
+          type="number"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          step="0.01"
+          required
+          inputMode="numeric"
+          pattern="[0-9]*"
+        />
+        <TailwindSelect label="Tipo:" value={type} onChange={(e) => setType(e.target.value)}>
+          <option value="expense">Gasto</option>
+          <option value="income">Ingreso</option>
+        </TailwindSelect>
+        <TailwindSelect label="Ubicación del Dinero:" value={account} onChange={(e) => setAccount(e.target.value)}>
+          {moneyStorageBanks.map((b, index) => (
+            <option key={index} value={b}>{b}</option>
+          ))}
+        </TailwindSelect>
+        <div className="flex justify-end gap-2 mt-6">
+          <TailwindButton variant="secondary" onClick={onClose}>
+            Cancelar
+          </TailwindButton>
+          <TailwindButton variant="success" type="submit">
+            Guardar Cambios
+          </TailwindButton>
+        </div>
+      </form>
+    </TailwindModal>
+  );
+}
+
 
 // Componente TransferModal (Modal de Transferencia)
 function TransferModal({ moneyStorageBanks, onClose, show }) {
@@ -1983,6 +2553,7 @@ function FutureExpenses() {
   const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
   const [loading, setLoading] = useState(true);
   const [allCommunityWallets, setAllCommunityWallets] = useState([]);
+  const [userBanks, setUserBanks] = useState([]); // To fetch user's banks
   const [showModifyModal, setShowModifyModal] = useState(false);
   const [itemToModify, setItemToModify] = useState(null);
 
@@ -1990,6 +2561,15 @@ function FutureExpenses() {
 
   useEffect(() => {
     if (!db || !userId) return;
+
+    // Fetch user's banks
+    const qBanks = query(collection(db, `artifacts/${appId}/users/${userId}/banks`));
+    const unsubscribeBanks = onSnapshot(qBanks, (snapshot) => {
+      const fetchedBanks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setUserBanks(fetchedBanks);
+    }, (error) => {
+      console.error("Error al obtener bancos del usuario:", error);
+    });
 
     const q = query(collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`));
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -2033,11 +2613,12 @@ function FutureExpenses() {
     return () => {
       unsubscribe();
       unsubscribeCommunityWallets();
+      unsubscribeBanks(); // Clean up banks subscription
     };
   }, [db, userId, appId, showMessage]);
 
   useEffect(() => {
-    if (!db || !userId || allCommunityWallets.length === 0) return;
+    if (!db || !userId || allCommunityWallets.length === 0 || userBanks.length === 0) return;
 
     const aggregateCreditCardDebts = async () => {
       const creditCardDebtsByMonthAndCard = {}; // { 'YYYY-MM': { 'BANK - CARD_TYPE': { amount: total, reimbursements: [] } } }
@@ -2050,18 +2631,25 @@ function FutureExpenses() {
           const qExpenses = query(
             collection(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/expenses`),
             where('type', '==', 'credit_card'),
-            where('isSettled', '==', false)
+            // **Corrección para el punto 6 del usuario:**
+            // Ya NO filtramos por 'isSettled: false' aquí.
+            // La deuda de la tarjeta en Gastos Futuros debe reflejar el total de la tarjeta,
+            // independientemente de los reembolsos internos entre miembros.
+            // where('isSettled', '==', false) // REMOVED
           );
           const expenseSnapshot = await getDocs(qExpenses);
           expenseSnapshot.docs.forEach(expenseDoc => {
             const expenseData = expenseDoc.data();
             console.log("FutureExpenses: Procesando gasto de tarjeta:", expenseData);
 
-            // Get the user's share of this expense. If splitDetails is undefined or userId is not in it, userShare is 0.
-            const userShare = parseFloat(expenseData.splitDetails?.[userId]) || 0;
-            console.log(`FutureExpenses: userShare para ${userId}:`, userShare);
+            let userShare = parseFloat(expenseData.splitDetails?.[userId]) || 0;
+            // **Corrección para el punto 2 del usuario:**
+            // Si es un gasto en cuotas, la parte del usuario es la cuota mensual.
+            if (expenseData.isInstallment && expenseData.installmentAmount) {
+              userShare = parseFloat(expenseData.installmentAmount);
+            }
+            console.log(`FutureExpenses: userShare para ${userId} (ajustado por cuotas):`, userShare);
 
-            // The 'expenseDate' is when the transaction happened. The 'dueDate' is when it needs to be paid.
             const expenseTimestamp = expenseData.date;
             let expenseDate;
             if (expenseTimestamp && expenseTimestamp.toDate) {
@@ -2073,10 +2661,25 @@ function FutureExpenses() {
             }
             console.log("FutureExpenses: expenseDate (parsed):", expenseDate);
 
-            // Calculate due date for the next month (first day of next month)
-            const dueDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth() + 1, 1);
+            // Determine due date based on credit card closing day
+            const bankDetails = userBanks.find(b => b.name === expenseData.bank && b.type === 'credit_card');
+            const closingDayOfMonth = bankDetails?.closingDayOfMonth || 1; // Default to 1st if not set
+
+            let dueDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth(), 1); // Start of current month
+            const transactionDay = expenseDate.getDate();
+
+            if (transactionDay <= closingDayOfMonth) {
+              // Expense falls into current cycle, due next month
+              dueDate.setMonth(dueDate.getMonth() + 1);
+            } else {
+              // Expense falls into next cycle, due month after next
+              dueDate.setMonth(dueDate.getMonth() + 2);
+            }
+            // Set day to 1st for consistency in future expense aggregation
+            dueDate.setDate(1); 
+
             const dueMonthYear = `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, '0')}`;
-            console.log("FutureExpenses: dueDate:", dueDate, "dueMonthYear:", dueMonthYear);
+            console.log("FutureExpenses: dueDate (calculated):", dueDate, "dueMonthYear:", dueMonthYear);
 
             const bankName = expenseData.bank || 'Desconocido';
             const cardType = expenseData.cardType || 'General';
@@ -2090,10 +2693,8 @@ function FutureExpenses() {
               creditCardDebtsByMonthAndCard[dueMonthYear][key] = { amount: 0, reimbursements: [] };
             }
 
-            // Always add the user's share to the amount, as this is what they owe to the card
             creditCardDebtsByMonthAndCard[dueMonthYear][key].amount += userShare;
             console.log(`FutureExpenses: Monto agregado para ${key} en ${dueMonthYear}:`, creditCardDebtsByMonthAndCard[dueMonthYear][key].amount);
-
 
             const payer = membersInWallet.find(m => m.id === expenseData.payerId);
             const payerName = payer ? payer.name : 'Desconocido';
@@ -2112,6 +2713,7 @@ function FutureExpenses() {
                   amount: memberShare,
                   description: expenseData.description,
                   walletName: wallet.name,
+                  walletId: wallet.id, // Add walletId for more specific tracking
                 });
                 console.log(`FutureExpenses: Reembolso 'owed_to_you' añadido: ${participantName} te debe ${memberShare}`);
               }
@@ -2124,6 +2726,7 @@ function FutureExpenses() {
                   amount: memberShare,
                   description: expenseData.description,
                   walletName: wallet.name,
+                  walletId: wallet.id, // Add walletId for more specific tracking
                 });
                 console.log(`FutureExpenses: Reembolso 'you_owe' añadido: Debes ${memberShare} a ${payerName}`);
               }
@@ -2143,17 +2746,12 @@ function FutureExpenses() {
       existingCommunityCreditCardDebts.forEach(existingItem => {
         const itemStartDate = existingItem.startDate && existingItem.startDate.toDate ? existingItem.startDate.toDate() : new Date();
         const itemMonthYear = `${itemStartDate.getFullYear()}-${String(itemStartDate.getMonth() + 1).padStart(2, '0')}`;
-        // The description for credit card debts is "Deuda Tarjeta Crédito (Comunitaria) - BANK - CARD_TYPE"
-        // So, to get the key, we remove the prefix.
         const itemKey = existingItem.description.replace('Deuda Tarjeta Crédito (Comunitaria) - ', '');
-        console.log("FutureExpenses: Existing item - itemMonthYear:", itemMonthYear, "itemKey:", itemKey);
-
 
         const hasRelevantDebt = creditCardDebtsByMonthAndCard[itemMonthYear] &&
                                 creditCardDebtsByMonthAndCard[itemMonthYear][itemKey] &&
-                                creditCardDebtsByMonthAndCard[itemMonthYear][itemKey].amount > 0; // Check amount > 0
-        console.log("FutureExpenses: Existing item - hasRelevantDebt:", hasRelevantDebt);
-
+                                creditCardDebtsByMonthAndCard[itemMonthYear][itemKey].amount > 0;
+        
         if (!hasRelevantDebt) {
           console.log("FutureExpenses: Eliminando deuda de tarjeta existente (no relevante):", existingItem.id);
           batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, existingItem.id));
@@ -2181,9 +2779,10 @@ function FutureExpenses() {
               type: 'community_credit_card_debt',
               recurrence: 'one_time',
               startDate: startDate, // This will be a Date object, Firestore will convert it to Timestamp
-              sourceWalletId: 'all_community_wallets',
+              sourceWalletId: 'all_community_wallets', // This is a general aggregation, not a single wallet
               reimbursements: reimbursements,
-              createdAt: serverTimestamp(),
+              createdAt: existingItem ? existingItem.createdAt : serverTimestamp(),
+              lastModifiedDate: serverTimestamp(),
             };
 
             if (existingItem) {
@@ -2203,7 +2802,7 @@ function FutureExpenses() {
     };
 
     aggregateCreditCardDebts();
-  }, [db, userId, appId, allCommunityWallets, futureItems]); // Dependencias actualizadas
+  }, [db, userId, appId, allCommunityWallets, userBanks]); // Dependencias actualizadas
 
   const handleAddFutureItem = async (e) => {
     e.preventDefault();
@@ -2261,20 +2860,27 @@ function FutureExpenses() {
   };
 
   const handlePayFutureExpense = async (item) => {
-    if (!db || !userId) return;
+    if (!db || !userId) {
+      showMessage("Error: Datos de usuario no disponibles para pagar el gasto.", "danger");
+      return;
+    }
 
     const itemDate = item.startDate && item.startDate.toDate ? item.startDate.toDate() : new Date();
     const currentMonth = new Date().getMonth();
     const currentYear = new Date().getFullYear();
 
-    if (itemDate.getMonth() > currentMonth || itemDate.getFullYear() > currentYear) {
-      showMessage("Este gasto es para un mes futuro y no se puede pagar aún.", "warning");
+    // Check if the expense is for a future month/year
+    if (itemDate.getFullYear() > currentYear || (itemDate.getFullYear() === currentYear && itemDate.getMonth() > currentMonth)) {
+      showMessage("Este gasto es para un mes futuro y no se puede marcar como pagado aún.", "warning");
       return;
     }
 
     try {
-      // Registrar la transacción en la billetera personal
-      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`), {
+      const batch = writeBatch(db);
+
+      // 1. Registrar la transacción en la billetera personal
+      const personalWalletRef = collection(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`);
+      batch.add(personalWalletRef, {
         description: `Pago de gasto futuro: ${item.description}`,
         amount: item.amount,
         type: 'expense',
@@ -2282,9 +2888,38 @@ function FutureExpenses() {
         date: serverTimestamp(),
       });
 
-      // Eliminar el gasto futuro
-      await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, item.id));
+      // **Corrección para el punto 6 del usuario:**
+      // Ya NO modificamos el estado 'isSettled' de los gastos originales en la billetera comunitaria aquí.
+      // El total de la tarjeta en Gastos Futuros debe mantenerse constante.
+      /*
+      if (item.type === 'community_credit_card_debt' && item.reimbursements) {
+        for (const reimbursement of item.reimbursements) {
+          const qOriginalExpense = query(
+            collection(db, `artifacts/${appId}/public/data/communityWallets/${reimbursement.walletId}/expenses`),
+            where('description', '==', reimbursement.description),
+            where('amount', '==', reimbursement.amount), 
+            where('payerId', '==', reimbursement.toId), // Payer of the original expense
+            where('type', '==', 'credit_card'),
+            where('isSettled', '==', false)
+          );
+          const originalExpenseSnapshot = await getDocs(qOriginalExpense);
+          if (!originalExpenseSnapshot.empty) {
+            originalExpenseSnapshot.docs.forEach(originalDoc => {
+              console.log(`Marcando gasto comunitario como saldado: ${originalDoc.id}`);
+              batch.update(originalDoc.ref, { isSettled: true });
+            });
+          } else {
+            console.warn(`No se encontró el gasto original para el reembolso: ${reimbursement.description} en la billetera ${reimbursement.walletName}`);
+          }
+        }
+      }
+      */
 
+      // 2. Eliminar el gasto futuro (o marcarlo como pagado si es recurrente y se desea mantener un historial)
+      // Para este caso, lo eliminamos como se solicitó.
+      batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, item.id));
+
+      await batch.commit();
       showMessage(`Gasto "${item.description}" pagado y registrado en tu billetera personal.`, "success");
     } catch (error) {
       console.error("Error al pagar gasto futuro:", error);
@@ -2566,14 +3201,17 @@ function BankManagement() {
   const [banks, setBanks] = useState([]);
   const [newBankName, setNewBankName] = useState('');
   const [newBankType, setNewBankType] = useState('money_storage');
+  const [newClosingDayOfMonth, setNewClosingDayOfMonth] = useState(''); // New state for closing day
   const [loading, setLoading] = useState(true);
+  const [personalTransactions, setPersonalTransactions] = useState([]); // To calculate credit card summary
+  const [communityWallets, setCommunityWallets] = useState([]); // To get community expenses
 
   useEffect(() => {
     if (!db || !userId) return;
 
     const q = query(collection(db, `artifacts/${appId}/users/${userId}/banks`));
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const fetchedBanks = snapshot.docs.map(doc => ({ id: doc.id, name: doc.data().name, type: doc.data().type, ownerId: doc.data().ownerId || userId }));
+      const fetchedBanks = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setBanks(fetchedBanks);
       setLoading(false);
     }, (error) => {
@@ -2582,13 +3220,44 @@ function BankManagement() {
       setLoading(false);
     });
 
-    return () => unsubscribe();
+    // Fetch personal transactions
+    const qPersonalTransactions = query(collection(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`));
+    const unsubscribePersonalTransactions = onSnapshot(qPersonalTransactions, (snapshot) => {
+      setPersonalTransactions(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    });
+
+    // Fetch community wallets and their expenses
+    const qCommunityWallets = query(collection(db, `artifacts/${appId}/public/data/communityWallets`));
+    const unsubscribeCommunityWallets = onSnapshot(qCommunityWallets, async (snapshot) => {
+      const walletsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const expensesPromises = walletsData.map(async (wallet) => {
+        const qExpenses = query(collection(db, `artifacts/${appId}/public/data/communityWallets/${wallet.id}/expenses`));
+        const expenseSnapshot = await getDocs(qExpenses);
+        return expenseSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      });
+      const allExpenses = await Promise.all(expensesPromises);
+      const walletsWithExpenses = walletsData.map((wallet, index) => ({
+        ...wallet,
+        expenses: allExpenses[index],
+      }));
+      setCommunityWallets(walletsWithExpenses);
+    });
+
+    return () => {
+      unsubscribe();
+      unsubscribePersonalTransactions();
+      unsubscribeCommunityWallets();
+    };
   }, [db, userId, appId, showMessage]);
 
   const handleAddBank = async (e) => {
     e.preventDefault();
     if (!newBankName.trim()) {
       showMessage("El nombre del banco no puede estar vacío.", "danger");
+      return;
+    }
+    if (newBankType === 'credit_card' && (!newClosingDayOfMonth || parseInt(newClosingDayOfMonth) < 1 || parseInt(newClosingDayOfMonth) > 31)) {
+      showMessage("Para tarjetas de crédito, especifica un día de cierre válido (1-31).", "danger");
       return;
     }
     if (!db || !userId) return;
@@ -2598,9 +3267,11 @@ function BankManagement() {
         name: newBankName.trim(),
         type: newBankType,
         ownerId: userId, // Always set owner to current user
+        closingDayOfMonth: newBankType === 'credit_card' ? parseInt(newClosingDayOfMonth) : null,
         createdAt: serverTimestamp(),
       });
       setNewBankName('');
+      setNewClosingDayOfMonth('');
       showMessage("Banco añadido exitosamente!", "success");
     } catch (error) {
       console.error("Error al añadir banco:", error);
@@ -2618,6 +3289,61 @@ function BankManagement() {
       showMessage("Error al eliminar el banco.", "danger");
     }
   };
+
+  const calculateCreditCardSummary = () => {
+    const summaries = {};
+    const today = new Date();
+
+    banks.filter(b => b.type === 'credit_card').forEach(cardBank => {
+      const closingDay = cardBank.closingDayOfMonth;
+      if (!closingDay) return;
+
+      // Calculate last and next closing dates
+      let lastClosingDate = new Date(today.getFullYear(), today.getMonth(), closingDay);
+      if (today.getDate() <= closingDay) {
+        lastClosingDate.setMonth(lastClosingDate.getMonth() - 1);
+      }
+      
+      let nextClosingDate = new Date(lastClosingDate.getFullYear(), lastClosingDate.getMonth() + 1, closingDay);
+
+      let currentCycleTotal = 0;
+
+      // Add personal transactions made with this card in the current cycle
+      personalTransactions.forEach(t => {
+        if (t.type === 'expense' && t.account === cardBank.name && t.date) {
+          const transactionDate = t.date.toDate();
+          if (transactionDate >= lastClosingDate && transactionDate <= nextClosingDate) {
+            currentCycleTotal += t.amount;
+          }
+        }
+      });
+
+      // Add user's share of community expenses made with this card in the current cycle
+      communityWallets.forEach(wallet => {
+        if (wallet.members && wallet.members.some(m => m.id === userId)) {
+          wallet.expenses.forEach(exp => {
+            if (exp.type === 'credit_card' && exp.bank === cardBank.name && exp.date) {
+              const expenseDate = exp.date.toDate();
+              if (expenseDate >= lastClosingDate && expenseDate <= nextClosingDate) {
+                // If it's an installment, add the monthly installment amount, not the total
+                const amountToAdd = exp.isInstallment && exp.installmentAmount ? exp.installmentAmount : (exp.splitDetails?.[userId] || 0);
+                currentCycleTotal += amountToAdd;
+              }
+            }
+          });
+        }
+      });
+
+      summaries[cardBank.id] = {
+        name: cardBank.name,
+        currentCycleTotal: currentCycleTotal,
+        nextClosingDate: nextClosingDate.toLocaleDateString('es-AR', { day: '2-digit', month: 'long', year: 'numeric' }),
+      };
+    });
+    return summaries;
+  };
+
+  const creditCardSummaries = calculateCreditCardSummary();
 
   if (loading) {
     return (
@@ -2645,6 +3371,21 @@ function BankManagement() {
             <option value="money_storage">Banco para Almacenamiento de Dinero</option>
             <option value="credit_card">Tarjeta de Crédito</option>
           </TailwindSelect>
+
+          {newBankType === 'credit_card' && (
+            <TailwindInput
+              label="Día de Cierre de Tarjeta (1-31):"
+              type="number"
+              value={newClosingDayOfMonth}
+              onChange={(e) => setNewClosingDayOfMonth(e.target.value)}
+              min="1"
+              max="31"
+              required
+              inputMode="numeric"
+              pattern="[0-9]*"
+            />
+          )}
+
           {/* Propietario del Banco: Siempre el usuario actual, no se puede cambiar */}
           <div className="mb-4">
             <label className="block text-gray-700 text-sm font-bold mb-2">Propietario del Banco:</label>
@@ -2658,6 +3399,31 @@ function BankManagement() {
         </form>
       </TailwindCard>
 
+      {/* Sección de Resumen de Tarjetas de Crédito */}
+      <TailwindCard className="bg-green-50 p-6 mb-6 shadow-sm rounded-lg border-0">
+        <h3 className="text-xl font-semibold text-gray-800 mb-4">Resumen de Tarjetas de Crédito</h3>
+        {Object.keys(creditCardSummaries).length === 0 ? (
+          <p className="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">No tienes tarjetas de crédito configuradas o gastos en ellas.</p>
+        ) : (
+          <ul className="divide-y divide-gray-200">
+            {Object.values(creditCardSummaries).map((summary, index) => (
+              <li key={index} className="bg-white shadow-sm rounded-lg mb-2 p-4">
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
+                  <span className="font-medium text-gray-800">{summary.name}</span>
+                  <span className={`font-bold text-xl mt-2 sm:mt-0 ${summary.currentCycleTotal >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                    ${summary.currentCycleTotal.toFixed(2)}
+                  </span>
+                </div>
+                <p className="text-gray-600 text-sm mt-1">
+                  Próximo Cierre: <span className="font-semibold">{summary.nextClosingDate}</span>
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </TailwindCard>
+
+
       <TailwindCard className="bg-purple-50 p-6 shadow-sm rounded-lg border-0">
         <h3 className="text-xl font-semibold text-gray-800 mb-4">Tus Bancos Guardados</h3>
         {banks.length === 0 ? (
@@ -2670,6 +3436,7 @@ function BankManagement() {
                   <span className="font-medium text-gray-800">{bank.name}</span>
                   <p className="text-sm text-gray-500 mt-1">
                     Tipo: {bank.type === 'money_storage' ? 'Almacenamiento de Dinero' : 'Tarjeta de Crédito'}
+                    {bank.type === 'credit_card' && bank.closingDayOfMonth && ` (Cierre: Día ${bank.closingDayOfMonth})`}
                   </p>
                   <p className="text-sm text-gray-500 mt-1">
                     Propietario: Yo ({userName || 'Usuario Actual'})
