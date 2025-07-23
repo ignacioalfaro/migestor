@@ -404,7 +404,7 @@ function App() {
         <div className="flex-grow max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 w-full">
           {userId && (
             <p className="text-center text-gray-500 mb-6 p-3 bg-white rounded-lg shadow-sm inline-block mx-auto">
-              Hola, <code className="font-mono text-blue-600 font-bold">{userName}</code> (ID: <code className="font-mono text-blue-600 font-bold">{userId}</code>)
+              Hola, <code className="font-mono text-blue-600 font-bold">{userName}</code>
             </p>
           )}
 
@@ -475,6 +475,8 @@ function CommunityWalletsList({ onSelectWallet }) {
   const [wallets, setWallets] = useState([]);
   const [newWalletName, setNewWalletName] = useState('');
   const [loading, setLoading] = useState(true);
+  const [showDeleteWalletModal, setShowDeleteWalletModal] = useState(false);
+  const [walletToDelete, setWalletToDelete] = useState(null);
 
   useEffect(() => {
     if (!db || !userId) return;
@@ -521,6 +523,66 @@ function CommunityWalletsList({ onSelectWallet }) {
     }
   };
 
+  const handleDeleteWallet = (wallet) => {
+    setWalletToDelete(wallet);
+    setShowDeleteWalletModal(true);
+  };
+
+  const confirmDeleteWallet = async () => {
+    if (!db || !walletToDelete?.id || !userId) return;
+
+    try {
+      const batch = writeBatch(db);
+
+      // 1. Eliminar gastos de la subcolección
+      const expensesRef = collection(db, `artifacts/${appId}/public/data/communityWallets/${walletToDelete.id}/expenses`);
+      const expenseDocs = await getDocs(expensesRef);
+      expenseDocs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      // 2. Eliminar ingresos de la subcolección
+      const incomeRef = collection(db, `artifacts/${appId}/public/data/communityWallets/${walletToDelete.id}/income`);
+      const incomeDocs = await getDocs(incomeRef);
+      incomeDocs.forEach(doc => {
+        batch.delete(doc.ref);
+      });
+
+      // 3. Eliminar elementos de 'community_credit_card_debt' asociados a esta billetera en 'futureExpenses' del usuario
+      const futureExpensesRef = collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`);
+      const qFutureDebts = query(
+        futureExpensesRef,
+        where('type', '==', 'community_credit_card_debt')
+      );
+      const futureDebtsSnapshot = await getDocs(qFutureDebts);
+      futureDebtsSnapshot.docs.forEach(docSnap => {
+        const debtData = docSnap.data();
+        // Check if this specific debt is linked to the wallet being deleted
+        // This assumes that the 'reimbursements' array contains info about the source wallet
+        // A more robust solution would be to add a 'sourceWalletId' field directly to the future expense item
+        const isRelatedToDeletedWallet = debtData.reimbursements && debtData.reimbursements.some(
+          r => r.walletName === walletToDelete.name // Assuming walletName is unique enough or we need walletId
+        );
+
+        if (isRelatedToDeletedWallet) {
+          batch.delete(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, docSnap.id));
+        }
+      });
+
+      // 4. Eliminar el documento de la billetera principal
+      batch.delete(doc(db, `artifacts/${appId}/public/data/communityWallets/${walletToDelete.id}`));
+      
+      await batch.commit();
+      showMessage(`Billetera "${walletToDelete.name}" y sus datos eliminados exitosamente.`, "success");
+      setShowDeleteWalletModal(false);
+      setWalletToDelete(null);
+    } catch (error) {
+      console.error("Error al eliminar billetera:", error);
+      showMessage(`Error al eliminar la billetera: ${error.message}`, "danger");
+    }
+  };
+
+
   if (loading) {
     return (
       <div className="flex justify-center items-center h-full">
@@ -553,16 +615,59 @@ function CommunityWalletsList({ onSelectWallet }) {
           {wallets.map((wallet) => (
             <li
               key={wallet.id}
-              onClick={() => onSelectWallet(wallet)}
-              className="flex flex-col sm:flex-row justify-between items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2 cursor-pointer hover:shadow-md transition-shadow duration-200"
+              className="flex flex-col sm:flex-row justify-between items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2"
             >
-              <span className="text-lg font-medium text-gray-800">{wallet.name}</span>
-              <span className="text-gray-500 text-sm mt-1 sm:mt-0">{wallet.members ? wallet.members.length : 1} miembro(s)</span>
+              <div
+                onClick={() => onSelectWallet(wallet)}
+                className="flex-grow cursor-pointer hover:text-blue-700 transition-colors duration-200"
+              >
+                <span className="text-lg font-medium text-gray-800">{wallet.name}</span>
+                <span className="text-gray-500 text-sm mt-1 sm:mt-0 ml-2">{wallet.members ? wallet.members.length : 1} miembro(s)</span>
+              </div>
+              <TailwindButton
+                variant="danger"
+                className="px-3 py-1 text-sm mt-2 sm:mt-0"
+                onClick={(e) => {
+                  e.stopPropagation(); // Evita que se active el onClick del li
+                  handleDeleteWallet(wallet);
+                }}
+              >
+                Eliminar
+              </TailwindButton>
             </li>
           ))}
         </ul>
       )}
+
+      {walletToDelete && (
+        <DeleteWalletConfirmationModal
+          show={showDeleteWalletModal}
+          onClose={() => setShowDeleteWalletModal(false)}
+          onConfirm={confirmDeleteWallet}
+          walletName={walletToDelete.name}
+        />
+      )}
     </TailwindCard>
+  );
+}
+
+// Componente DeleteWalletConfirmationModal
+function DeleteWalletConfirmationModal({ show, onClose, onConfirm, walletName }) {
+  return (
+    <TailwindModal show={show} onClose={onClose} title="Confirmar Eliminación">
+      <p className="text-center text-gray-700 mb-6">
+        ¿Estás seguro de que quieres eliminar la billetera "<span className="font-bold text-red-600">{walletName}</span>"?
+        Esto eliminará todos los gastos e ingresos asociados a esta billetera. Esta acción no se puede deshacer.
+      </p>
+      <div className="flex justify-center gap-4 mt-6">
+        <TailwindButton variant="secondary" onClick={onClose}>
+          Cancelar
+        </TailwindButton>
+        <TailwindButton variant="danger" onClick={onConfirm}>
+          Eliminar
+        </TailwindButton>
+      </div>
+    </TailwindModal>
   );
 }
 
@@ -817,7 +922,7 @@ function CommunityWalletDetail({ wallet, onBack }) {
         <div className="flex flex-wrap gap-2 mb-4">
           {members.map(m => (
             <span key={m.id} className="bg-blue-200 text-blue-800 text-sm font-medium px-3 py-1 rounded-full">
-              {m.name} ({m.id === userId ? 'Tú' : m.id.substring(0, 4)}...)
+              {m.name}
             </span>
           ))}
         </div>
@@ -852,6 +957,90 @@ function CommunityWalletDetail({ wallet, onBack }) {
           Exportar Gastos Tarjeta (Excel)
         </TailwindButton>
       </div>
+
+      {/* Sección de Deudas y Saldos Detallados */}
+      <TailwindCard className="bg-purple-50 p-6 mb-6 shadow-sm rounded-lg border-0">
+        <h3 className="text-xl font-semibold text-gray-800 mb-4">Deudas y Saldos Detallados</h3>
+        
+        {/* Reembolsos Pendientes (General) */}
+        <div className="mb-6">
+          <h4 className="text-lg font-semibold text-gray-700 mb-3 border-b pb-2">Reembolsos Pendientes (Neto)</h4>
+          {reimbursements.length === 0 ? (
+            <p className="text-center text-gray-500 p-3 bg-gray-50 rounded-lg">¡Todo está saldado en esta billetera!</p>
+          ) : (
+            <ul className="divide-y divide-gray-200">
+              {reimbursements.map((debt, index) => (
+                <li
+                  key={index}
+                  onClick={() => handleShowReimbursementDetail(debt)}
+                  className="flex flex-col sm:flex-row justify-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2 cursor-pointer hover:shadow-md transition-shadow duration-200"
+                >
+                  <span className="text-gray-800">
+                    <span className="font-semibold text-red-600">{debt.from}</span> le debe a <span className="font-semibold text-green-600">{debt.to}</span>
+                  </span>
+                  <span className="font-bold text-xl text-green-600 mt-2 sm:mt-0">${debt.amount.toFixed(2)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {/* Gastos de Tarjeta de Crédito Pendientes */}
+        <div>
+          <h4 className="text-lg font-semibold text-gray-700 mb-3 border-b pb-2">Gastos de Tarjeta de Crédito Pendientes</h4>
+          {expenses.filter(exp => exp.type === 'credit_card' && !exp.isSettled).length === 0 ? (
+            <p className="text-center text-gray-500 p-3 bg-gray-50 rounded-lg">No hay gastos de tarjeta de crédito pendientes en esta billetera.</p>
+          ) : (
+            <ul className="divide-y divide-gray-200">
+              {expenses.filter(exp => exp.type === 'credit_card' && !exp.isSettled).map((expense) => (
+                <li key={expense.id} className="bg-white shadow-sm rounded-lg mb-2 p-4 border border-blue-200">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
+                    <span className="font-medium text-gray-800">{expense.description}</span>
+                    <span className="font-bold text-xl text-red-600 mt-2 sm:mt-0">-${expense.amount.toFixed(2)}</span>
+                  </div>
+                  <p className="text-gray-600 text-sm mt-1">
+                    Pagado por: <span className="font-semibold">{members.find(m => m.id === expense.payerId)?.name || 'Desconocido'}</span>
+                  </p>
+                  <p className="text-gray-500 text-xs mt-1">
+                    Tarjeta: <span className="font-semibold">{expense.bank} - {expense.cardType}</span>
+                  </p>
+                  {expense.splitDetails && Object.keys(expense.splitDetails).length > 0 && (
+                    <div className="text-xs text-gray-500 mt-2">
+                      Detalle de Responsabilidad:
+                      <ul className="list-disc list-inside ml-2">
+                        {Object.entries(expense.splitDetails).map(([memberId, value]) => (
+                          <li key={memberId}>
+                            {members.find(m => m.id === memberId)?.name || memberId}: {expense.splitType === 'percentage' ? `${value}%` : `$${value.toFixed(2)}`}
+                            {memberId === userId && <span className="font-bold text-blue-600"> (Tú)</span>}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {expense.isInstallment && (
+                    <p className="text-purple-600 font-medium text-xs mt-2">
+                      En cuotas: {expense.totalInstallments} cuotas de ${expense.installmentAmount.toFixed(2)} (hasta {expense.installmentEndDate ? new Date(expense.installmentEndDate.seconds * 1000).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' }) : 'N/A'})
+                    </p>
+                  )}
+                  <p className="text-gray-500 text-xs mt-2">
+                    Fecha: {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
+                  </p>
+                  <div className="text-right mt-3">
+                    <TailwindButton
+                      variant="info"
+                      className="px-4 py-2 text-sm"
+                      onClick={() => handleMarkAsSettled(expense.id)}
+                    >
+                      Marcar como Saldado
+                    </TailwindButton>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </TailwindCard>
+
 
       {/* Lista de Ingresos */}
       <TailwindCard className="bg-yellow-50 p-6 mb-6 shadow-sm rounded-lg border-0">
@@ -931,29 +1120,6 @@ function CommunityWalletDetail({ wallet, onBack }) {
                 <p className="text-gray-500 text-xs mt-2">
                   Fecha: {expense.date ? new Date(expense.date.seconds * 1000).toLocaleDateString('es-AR') : 'N/A'}
                 </p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </TailwindCard>
-
-      {/* Sección de Reembolsos */}
-      <TailwindCard className="bg-green-50 p-6 shadow-sm rounded-lg border-0">
-        <h3 className="text-xl font-semibold text-gray-800 mb-4">Reembolsos Pendientes</h3>
-        {reimbursements.length === 0 ? (
-          <p className="text-center text-gray-500 p-4 bg-gray-50 rounded-lg">¡Todo está saldado en esta billetera!</p>
-        ) : (
-          <ul className="divide-y divide-gray-200">
-            {reimbursements.map((debt, index) => (
-              <li
-                key={index}
-                onClick={() => handleShowReimbursementDetail(debt)}
-                className="flex flex-col sm:flex-row justify-between items-start sm:items-center py-3 px-4 bg-white shadow-sm rounded-lg mb-2 cursor-pointer hover:shadow-md transition-shadow duration-200"
-              >
-                <span className="text-gray-800">
-                  <span className="font-semibold text-red-600">{debt.from}</span> le debe a <span className="font-semibold text-green-600">{debt.to}</span>
-                </span>
-                <span className="font-bold text-xl text-green-600 mt-2 sm:mt-0">${debt.amount.toFixed(2)}</span>
               </li>
             ))}
           </ul>
@@ -1046,6 +1212,24 @@ function AddCommunityExpenseModal({ walletId, members, onClose, show }) {
   const [creditCardBanks, setCreditCardBanks] = useState([]);
   const [isInstallment, setIsInstallment] = useState(false);
   const [totalInstallments, setTotalInstallments] = useState('');
+
+  // Limpiar el formulario al abrir/cerrar el modal
+  useEffect(() => {
+    if (show) {
+      setDescription('');
+      setAmount('');
+      setPayerId(userId);
+      setExpenseType('debit_cash');
+      setBank('');
+      setCardType('');
+      setSplitType('equal');
+      setSplitDetails({});
+      setSelectedParticipantsForExpense(members.map(m => m.id));
+      setIsInstallment(false);
+      setTotalInstallments('');
+    }
+  }, [show, userId, members]);
+
 
   useEffect(() => {
     if (db && userId) {
@@ -1514,6 +1698,7 @@ function PersonalWallet() {
         }
       });
 
+      const debts = [];
       const sortedBalances = Object.entries(balances).sort(([, a], [, b]) => a - b);
 
       let i = 0;
@@ -1798,6 +1983,8 @@ function FutureExpenses() {
   const [selectedMonth, setSelectedMonth] = useState(new Date().toISOString().slice(0, 7));
   const [loading, setLoading] = useState(true);
   const [allCommunityWallets, setAllCommunityWallets] = useState([]);
+  const [showModifyModal, setShowModifyModal] = useState(false);
+  const [itemToModify, setItemToModify] = useState(null);
 
   const fixedRecurringTypes = ['Alquiler', 'Edesur', 'Metrogas', 'Expensas'];
 
@@ -1810,11 +1997,11 @@ function FutureExpenses() {
       // Filtrar elementos futuros para mostrar solo deudas de tarjeta de crédito que involucren al usuario actual
       const filteredItems = items.filter(item => {
         if (item.type === 'community_credit_card_debt') {
-          return item.reimbursements && item.reimbursements.some(reimbursement =>
-            reimbursement.fromId === userId || reimbursement.toId === userId
-          );
+          // A community credit card debt item should be shown if its amount is > 0
+          // The aggregation logic already ensures 'amount' is the user's share.
+          return item.amount > 0; // This is the key change.
         }
-        return true; // Mantener otros tipos de gastos futuros
+        return true; // Keep other types of future expenses
       });
       setFutureItems(filteredItems);
       setLoading(false);
@@ -1870,21 +2057,31 @@ function FutureExpenses() {
             const expenseData = expenseDoc.data();
             console.log("FutureExpenses: Procesando gasto de tarjeta:", expenseData);
 
-            // Ensure splitDetails[userId] is a valid number
+            // Get the user's share of this expense. If splitDetails is undefined or userId is not in it, userShare is 0.
             const userShare = parseFloat(expenseData.splitDetails?.[userId]) || 0;
-            if (userShare === 0 && expenseData.payerId !== userId) {
-              console.log("FutureExpenses: Usuario no involucrado en este gasto o su participación es 0. Saltando.");
-              return; // Skip if user is not involved or their share is 0
+            console.log(`FutureExpenses: userShare para ${userId}:`, userShare);
+
+            // The 'expenseDate' is when the transaction happened. The 'dueDate' is when it needs to be paid.
+            const expenseTimestamp = expenseData.date;
+            let expenseDate;
+            if (expenseTimestamp && expenseTimestamp.toDate) {
+              expenseDate = expenseTimestamp.toDate();
+            } else if (expenseTimestamp && expenseTimestamp.seconds) {
+              expenseDate = new Date(expenseTimestamp.seconds * 1000);
+            } else {
+              expenseDate = new Date(); // Fallback if timestamp is missing or malformed
             }
+            console.log("FutureExpenses: expenseDate (parsed):", expenseDate);
 
-            const expenseDate = expenseData.date && expenseData.date.seconds ? new Date(expenseData.date.seconds * 1000) : new Date();
-
+            // Calculate due date for the next month (first day of next month)
             const dueDate = new Date(expenseDate.getFullYear(), expenseDate.getMonth() + 1, 1);
             const dueMonthYear = `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, '0')}`;
+            console.log("FutureExpenses: dueDate:", dueDate, "dueMonthYear:", dueMonthYear);
 
             const bankName = expenseData.bank || 'Desconocido';
             const cardType = expenseData.cardType || 'General';
             const key = `${bankName} - ${cardType}`;
+            console.log("FutureExpenses: Key para agregación:", key);
 
             if (!creditCardDebtsByMonthAndCard[dueMonthYear]) {
               creditCardDebtsByMonthAndCard[dueMonthYear] = {};
@@ -1893,7 +2090,10 @@ function FutureExpenses() {
               creditCardDebtsByMonthAndCard[dueMonthYear][key] = { amount: 0, reimbursements: [] };
             }
 
+            // Always add the user's share to the amount, as this is what they owe to the card
             creditCardDebtsByMonthAndCard[dueMonthYear][key].amount += userShare;
+            console.log(`FutureExpenses: Monto agregado para ${key} en ${dueMonthYear}:`, creditCardDebtsByMonthAndCard[dueMonthYear][key].amount);
+
 
             const payer = membersInWallet.find(m => m.id === expenseData.payerId);
             const payerName = payer ? payer.name : 'Desconocido';
@@ -1913,6 +2113,7 @@ function FutureExpenses() {
                   description: expenseData.description,
                   walletName: wallet.name,
                 });
+                console.log(`FutureExpenses: Reembolso 'owed_to_you' añadido: ${participantName} te debe ${memberShare}`);
               }
               else if (memberId === userId && expenseData.payerId !== userId && memberShare > 0) {
                 creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements.push({
@@ -1924,8 +2125,10 @@ function FutureExpenses() {
                   description: expenseData.description,
                   walletName: wallet.name,
                 });
+                console.log(`FutureExpenses: Reembolso 'you_owe' añadido: Debes ${memberShare} a ${payerName}`);
               }
             }
+            console.log("FutureExpenses: reimbursements actuales para el key:", creditCardDebtsByMonthAndCard[dueMonthYear][key].reimbursements);
           });
         }
       }
@@ -1940,11 +2143,16 @@ function FutureExpenses() {
       existingCommunityCreditCardDebts.forEach(existingItem => {
         const itemStartDate = existingItem.startDate && existingItem.startDate.toDate ? existingItem.startDate.toDate() : new Date();
         const itemMonthYear = `${itemStartDate.getFullYear()}-${String(itemStartDate.getMonth() + 1).padStart(2, '0')}`;
+        // The description for credit card debts is "Deuda Tarjeta Crédito (Comunitaria) - BANK - CARD_TYPE"
+        // So, to get the key, we remove the prefix.
         const itemKey = existingItem.description.replace('Deuda Tarjeta Crédito (Comunitaria) - ', '');
+        console.log("FutureExpenses: Existing item - itemMonthYear:", itemMonthYear, "itemKey:", itemKey);
+
 
         const hasRelevantDebt = creditCardDebtsByMonthAndCard[itemMonthYear] &&
                                 creditCardDebtsByMonthAndCard[itemMonthYear][itemKey] &&
-                                creditCardDebtsByMonthAndCard[itemMonthYear][itemKey].reimbursements.length > 0;
+                                creditCardDebtsByMonthAndCard[itemMonthYear][itemKey].amount > 0; // Check amount > 0
+        console.log("FutureExpenses: Existing item - hasRelevantDebt:", hasRelevantDebt);
 
         if (!hasRelevantDebt) {
           console.log("FutureExpenses: Eliminando deuda de tarjeta existente (no relevante):", existingItem.id);
@@ -1957,9 +2165,9 @@ function FutureExpenses() {
           const { amount, reimbursements } = creditCardDebtsByMonthAndCard[monthYear][key];
           const description = `Deuda Tarjeta Crédito (Comunitaria) - ${key}`;
           const [year, month] = monthYear.split('-').map(Number);
-          const startDate = new Date(year, month - 1, 1);
+          const startDate = new Date(year, month - 1, 1); // Month is 0-indexed for Date constructor
 
-          if (reimbursements.length > 0) {
+          if (amount > 0) { // Only save if there's an actual amount owed by the user
             const existingItem = existingCommunityCreditCardDebts.find(item =>
               item.description === description &&
               item.startDate && item.startDate.toDate &&
@@ -1983,6 +2191,7 @@ function FutureExpenses() {
               batch.update(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, existingItem.id), debtItemData);
             } else {
               console.log("FutureExpenses: Añadiendo nueva deuda de tarjeta:", debtItemData);
+              // Use set with a generated ID to avoid overwriting if a doc with the same ID already exists
               batch.set(doc(collection(db, `artifacts/${appId}/users/${userId}/futureExpenses`)), debtItemData);
             }
           }
@@ -2051,6 +2260,61 @@ function FutureExpenses() {
     }
   };
 
+  const handlePayFutureExpense = async (item) => {
+    if (!db || !userId) return;
+
+    const itemDate = item.startDate && item.startDate.toDate ? item.startDate.toDate() : new Date();
+    const currentMonth = new Date().getMonth();
+    const currentYear = new Date().getFullYear();
+
+    if (itemDate.getMonth() > currentMonth || itemDate.getFullYear() > currentYear) {
+      showMessage("Este gasto es para un mes futuro y no se puede pagar aún.", "warning");
+      return;
+    }
+
+    try {
+      // Registrar la transacción en la billetera personal
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/personalWalletTransactions`), {
+        description: `Pago de gasto futuro: ${item.description}`,
+        amount: item.amount,
+        type: 'expense',
+        account: 'Efectivo', // Asumimos efectivo por ahora, se podría añadir un selector
+        date: serverTimestamp(),
+      });
+
+      // Eliminar el gasto futuro
+      await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, item.id));
+
+      showMessage(`Gasto "${item.description}" pagado y registrado en tu billetera personal.`, "success");
+    } catch (error) {
+      console.error("Error al pagar gasto futuro:", error);
+      showMessage("Error al pagar el gasto futuro.", "danger");
+    }
+  };
+
+  const handleModifyFutureItem = (item) => {
+    setItemToModify(item);
+    setShowModifyModal(true);
+  };
+
+  const handleSaveModifiedItem = async (modifiedItem) => {
+    if (!db || !userId || !modifiedItem?.id) return;
+
+    try {
+      await updateDoc(doc(db, `artifacts/${appId}/users/${userId}/futureExpenses`, modifiedItem.id), {
+        description: modifiedItem.description,
+        amount: parseFloat(modifiedItem.amount),
+        lastModifiedDate: serverTimestamp(),
+      });
+      showMessage("Gasto futuro modificado exitosamente.", "success");
+      setShowModifyModal(false);
+      setItemToModify(null);
+    } catch (error) {
+      console.error("Error al modificar gasto futuro:", error);
+      showMessage("Error al modificar el gasto futuro.", "danger");
+    }
+  };
+
   const calculateMonthlyBalance = (monthYear) => {
     const [year, month] = monthYear.split('-').map(Number);
     let totalIncome = 0;
@@ -2068,7 +2332,11 @@ function FutureExpenses() {
         } else if (item.type === 'expense') {
           totalExpense += item.amount;
         } else if (item.type === 'community_credit_card_debt') {
-          totalExpense += item.amount;
+          // For credit card debt, ensure it's relevant for the selected month
+          const debtDueDate = item.startDate && item.startDate.seconds ? new Date(item.startDate.seconds * 1000) : new Date();
+          if (debtDueDate.getFullYear() === year && debtDueDate.getMonth() + 1 === month) {
+            totalExpense += item.amount;
+          }
         }
       }
     });
@@ -2173,7 +2441,7 @@ function FutureExpenses() {
         ) : (
           <ul className="divide-y divide-gray-200">
             {futureItems.map((item) => (
-              <li key={item.id} className="bg-white shadow-sm rounded-lg mb-2 p-4"> {/* This is line 2209 */}
+              <li key={item.id} className="bg-white shadow-sm rounded-lg mb-2 p-4">
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center">
                   <span className="font-medium text-gray-800">{item.description}</span>
                   <span className={`font-bold text-xl mt-2 sm:mt-0 ${item.type === 'income' ? 'text-green-600' : 'text-red-600'}`}>
@@ -2206,14 +2474,91 @@ function FutureExpenses() {
                     </ul>
                   </div>
                 )}
+                <div className="flex justify-end gap-2 mt-3">
+                  {item.type !== 'income' && (
+                    <TailwindButton variant="success" className="px-3 py-1 text-sm" onClick={() => handlePayFutureExpense(item)}>
+                      Pagado
+                    </TailwindButton>
+                  )}
+                  <TailwindButton variant="info" className="px-3 py-1 text-sm" onClick={() => handleModifyFutureItem(item)}>
+                    Modificar
+                  </TailwindButton>
+                </div>
               </li>
             ))}
           </ul>
         )}
       </TailwindCard>
+
+      {itemToModify && (
+        <ModifyFutureItemModal
+          show={showModifyModal}
+          onClose={() => setShowModifyModal(false)}
+          item={itemToModify}
+          onSave={handleSaveModifiedItem}
+        />
+      )}
     </TailwindCard>
   );
 }
+
+// Componente ModifyFutureItemModal
+function ModifyFutureItemModal({ show, onClose, item, onSave }) {
+  const [description, setDescription] = useState(item.description);
+  const [amount, setAmount] = useState(item.amount);
+
+  useEffect(() => {
+    if (item) {
+      setDescription(item.description);
+      setAmount(item.amount);
+    }
+  }, [item]);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!amount || parseFloat(amount) <= 0) {
+      // Assuming showMessage is available via context or passed down
+      alert("Por favor, ingresa un monto válido."); // Replace with TailwindAlert
+      return;
+    }
+    onSave({ ...item, description: description, amount: parseFloat(amount) });
+  };
+
+  return (
+    <TailwindModal show={show} onClose={onClose} title={`Modificar ${item.type === 'income' ? 'Ingreso' : 'Gasto'} Futuro`}>
+      <form onSubmit={handleSubmit}>
+        {item.type !== 'income' && ( // Allow description modification only for expenses
+          <TailwindInput
+            label="Descripción:"
+            type="text"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            required
+          />
+        )}
+        <TailwindInput
+          label="Monto:"
+          type="number"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          step="0.01"
+          required
+          inputMode="numeric"
+          pattern="[0-9]*"
+        />
+        <div className="flex justify-end gap-2 mt-6">
+          <TailwindButton variant="secondary" onClick={onClose}>
+            Cancelar
+          </TailwindButton>
+          <TailwindButton variant="primary" type="submit">
+            Guardar Cambios
+          </TailwindButton>
+        </div>
+      </form>
+    </TailwindModal>
+  );
+}
+
 
 // Componente BankManagement (Gestión de Bancos)
 function BankManagement() {
@@ -2221,9 +2566,7 @@ function BankManagement() {
   const [banks, setBanks] = useState([]);
   const [newBankName, setNewBankName] = useState('');
   const [newBankType, setNewBankType] = useState('money_storage');
-  const [newBankOwner, setNewBankOwner] = useState(userId);
   const [loading, setLoading] = useState(true);
-  const [communityMembers, setCommunityMembers] = useState([]);
 
   useEffect(() => {
     if (!db || !userId) return;
@@ -2239,27 +2582,7 @@ function BankManagement() {
       setLoading(false);
     });
 
-    const qCommunityWallets = query(collection(db, `artifacts/${appId}/public/data/communityWallets`));
-    const unsubscribeCommunityWallets = onSnapshot(qCommunityWallets, (snapshot) => {
-      const allMembers = new Set();
-      snapshot.docs.forEach(walletDoc => {
-        const walletData = walletDoc.data();
-        if (walletData.members) {
-          walletData.members.forEach(member => {
-            allMembers.add(JSON.stringify(member));
-          });
-        }
-      });
-      const uniqueMembers = Array.from(allMembers).map(memberStr => JSON.parse(memberStr));
-      setCommunityMembers(uniqueMembers);
-    }, (error) => {
-      console.error("Error al obtener miembros de la comunidad:", error);
-    });
-
-    return () => {
-      unsubscribe();
-      unsubscribeCommunityWallets();
-    };
+    return () => unsubscribe();
   }, [db, userId, appId, showMessage]);
 
   const handleAddBank = async (e) => {
@@ -2274,7 +2597,7 @@ function BankManagement() {
       await addDoc(collection(db, `artifacts/${appId}/users/${userId}/banks`), {
         name: newBankName.trim(),
         type: newBankType,
-        ownerId: newBankOwner,
+        ownerId: userId, // Always set owner to current user
         createdAt: serverTimestamp(),
       });
       setNewBankName('');
@@ -2322,12 +2645,13 @@ function BankManagement() {
             <option value="money_storage">Banco para Almacenamiento de Dinero</option>
             <option value="credit_card">Tarjeta de Crédito</option>
           </TailwindSelect>
-          <TailwindSelect label="Propietario del Banco:" value={newBankOwner} onChange={(e) => setNewBankOwner(e.target.value)}>
-            <option value={userId}>Yo ({userName || userId.substring(0, 4)}...)</option>
-            {communityMembers.filter(member => member.id !== userId).map(member => (
-              <option key={member.id} value={member.id}>{member.name} ({member.id.substring(0, 4)}...)</option>
-            ))}
-          </TailwindSelect>
+          {/* Propietario del Banco: Siempre el usuario actual, no se puede cambiar */}
+          <div className="mb-4">
+            <label className="block text-gray-700 text-sm font-bold mb-2">Propietario del Banco:</label>
+            <p className="shadow appearance-none border rounded-md w-full py-2 px-3 text-gray-700 leading-tight bg-gray-100 cursor-not-allowed">
+              Yo ({userName || 'Usuario Actual'})
+            </p>
+          </div>
           <TailwindButton variant="primary" type="submit" className="w-full mt-4">
             Añadir Banco
           </TailwindButton>
@@ -2348,7 +2672,7 @@ function BankManagement() {
                     Tipo: {bank.type === 'money_storage' ? 'Almacenamiento de Dinero' : 'Tarjeta de Crédito'}
                   </p>
                   <p className="text-sm text-gray-500 mt-1">
-                    Propietario: {communityMembers.find(m => m.id === bank.ownerId)?.name || 'Desconocido'} ({bank.ownerId === userId ? 'Tú' : bank.ownerId.substring(0, 4)}...)
+                    Propietario: Yo ({userName || 'Usuario Actual'})
                   </p>
                 </div>
                 <TailwindButton
